@@ -1,195 +1,211 @@
-# ⚡ NanoDB: High-Performance Vector Search Engine
+<div align="center">
 
-> A high-throughput, persistent Vector Database built from scratch in C++17 with Python bindings.
+```
+    _   __                  ____  ____
+   / | / /___ _____  ____  / __ \/ __ )
+  /  |/ / __ `/ __ \/ __ \/ / / / __  |
+ / /|  / /_/ / / / / /_/ / /_/ / /_/ /
+/_/ |_/\__,_/_/ /_/\____/_____/_____/
+```
 
-![C++](https://img.shields.io/badge/Language-C%2B%2B17-blue)
-![Python](https://img.shields.io/badge/Bindings-Python%203.11%2B-yellow)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
-![Status](https://img.shields.io/badge/Status-Functional-brightgreen)
+**A vector search engine built from scratch in C++17.**
 
-**NanoDB** is a lightweight vector search engine designed to handle high-dimensional embedding vectors (e.g., 128d, 768d). Unlike wrapper libraries, NanoDB implements a custom **HNSW (Hierarchical Navigable Small World)** graph from scratch with disk-backed persistence.
+Sub-millisecond ANN search. Zero external dependencies. Runs in Docker.
 
-It bridges the gap between raw algorithms (like FAISS) and full-scale databases (like Milvus) by offering a persistent, mmap-based storage engine without external dependencies.
+[![CI](https://github.com/shlokkvaishnav/nano-db/actions/workflows/ci.yml/badge.svg)](https://github.com/shlokkvaishnav/nano-db/actions)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED)](https://github.com/shlokkvaishnav/nano-db/pkgs/container/nanodb)
 
----
-
-## 🚀 Key Engineering Features
-
-### 1. Hybrid Storage Engine
-* **Vector Storage:** Uses **Memory Mapped Files (mmap)** to handle datasets larger than physical RAM. The OS page cache manages memory, allowing instant load times (Zero-Copy).
-* **Metadata Storage:** Implements an **Append-Only Log** with an in-memory offset index to store variable-length strings (filenames, JSON labels) alongside vectors.
-
-### 2. High-Performance Indexing
-* **HNSW Graph:** Logarithmic time complexity $O(\log N)$ for searching millions of vectors.
-* **SIMD Acceleration:** All three distance metrics are hand-optimized using **AVX2 Intrinsics**, achieving 4x–8x speedups over standard loops.
-
-### 3. Multiple Distance Metrics
-* **L2 (Euclidean):** Default. Squared distance, sqrt skipped for speed. General-purpose ANN.
-* **Cosine:** `1 - cosine_similarity`. Standard for NLP embedding pipelines (BERT, OpenAI embeddings, sentence transformers).
-* **Inner Product:** `-dot(a, b)`. Used in recommendation systems and with pre-normalized vectors (equivalent to cosine on unit vectors, but faster).
-
-### 4. Lazy Deletion
-* **Tombstone-based deletion:** `delete_vector(id)` marks a node as deleted in O(1). Deleted nodes are filtered at query time with no recall impact on live nodes.
-* **Tradeoff:** The node remains in the graph structure (edges still traverse it). Recall degrades slightly as the fraction of deleted nodes grows. Periodic index rebuilds are the standard remedy — the same approach used by FAISS IVF.
-
-### 5. Scalar Quantization (int8)
-* **4x memory reduction:** 128d float32 = 512 bytes → 128d int8 = 128 bytes per vector.
-* **ScalarQuantizer:** Trains per-dimension min/max, quantizes to `[-127, 127]`, and provides integer L2 distance for fast pre-filtering.
-* Typical recall loss: **1–5%** at equivalent `ef_search` settings.
-
-### 6. Concurrency & Locking
-* **Fine-Grained Locking:** Replaces global mutexes with a **Stripe of Atomic SpinLocks**, minimizing contention.
-* **Parallel Insertion:** Thread-safe architecture allows **6,500+ TPS** (Transactions Per Second) with 8+ concurrent threads.
+</div>
 
 ---
 
-## 📊 Performance Benchmarks
+## Why NanoDB?
 
-> **Hardware:** *(Fill in before publishing — see template below)*
-> ```
-> CPU:   [e.g. Intel Core i7-12700H, 14 cores, 20 threads, 2.3–4.7 GHz]
-> Cache: [e.g. L1 48KB/core, L2 1.25MB/core, L3 24MB shared]
-> RAM:   [e.g. 32GB DDR5-4800 dual-channel]
-> OS:    [e.g. Windows 11 22H2 / Ubuntu 22.04 LTS]
-> ```
-> Run `benchmark_throughput` and `benchmark_recall` to reproduce these numbers on your hardware.
+|  | FAISS | Milvus | **NanoDB** |
+|---|---|---|---|
+| Persistent storage | No | Yes | **Yes** (mmap) |
+| External dependencies | BLAS/LAPACK | etcd, MinIO, Pulsar | **None** |
+| REST API | No | Yes | **Yes** |
+| Docker deployment | Manual | ~500MB image | **Minimal image** |
+| Build from source | Complex | Complex | **Single cmake command** |
 
-*Dimensions: 128d (Float32)*
-
-| Metric | Single-Threaded | Multi-Threaded (8 Threads) |
-| :--- | :--- | :--- |
-| **Throughput (Insert)** | ~2,200 TPS | **~6,500 TPS** |
-| **Speedup** | 1.0x | **2.88x** |
-| **Search Latency** | ~0.15 ms | ~0.15 ms |
-
-### Why is the 8-thread speedup sublinear (2.88x, not 8x)?
-
-This is expected and worth understanding:
-
-1. **Lock contention on resize:** The `global_resize_lock_` serializes storage expansion events. With 8 threads inserting simultaneously, these rare-but-blocking events become a bottleneck.
-2. **Memory bandwidth saturation:** Each insert writes a full `Node` struct (~2KB for 128d float32 + neighbor arrays). 8 concurrent threads saturate the memory bus before all CPU cores are fully utilized.
-3. **Cache thrashing:** Inserting a node requires reading its neighbors' vectors to compute distances. Concurrent inserts from different threads cause cache line invalidations across cores.
-
-This is the same reason FAISS and Milvus cap parallel build speedup at 3–5x on commodity hardware.
+NanoDB bridges the gap between raw algorithms (FAISS) and full-scale distributed databases (Milvus) — a single-binary, persistent vector engine you can deploy in seconds.
 
 ---
 
-## 🛠️ Installation & Build
+## Quick Start
 
-NanoDB uses **CMake** for cross-platform build management.
+### Docker (fastest)
 
-### Prerequisites
-* C++17 Compiler (MSVC, GCC, or Clang)
-* CMake 3.10+
-* Python 3.x (for bindings)
-* CPU with AVX2 support (Intel Haswell 2013+ / AMD Ryzen 2017+)
+```bash
+docker run -p 8080:8080 ghcr.io/shlokkvaishnav/nanodb
 
-### Windows Build
-```powershell
-git clone https://github.com/shlokkvaishnav/nano-db.git
+# Insert a vector
+curl -X POST localhost:8080/vectors \
+  -H "Content-Type: application/json" \
+  -d '{"id": 0, "vector": [0.1, 0.2, ...], "metadata": "example"}'
+
+# Search
+curl -X POST localhost:8080/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, ...], "k": 5}'
+```
+
+### Build from Source
+
+```bash
+git clone --recursive https://github.com/shlokkvaishnav/nano-db.git
 cd nano-db
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DNANODB_BUILD_PYTHON=OFF
+cmake --build build -j$(nproc)
+
+# Run the server
+./build/nano_server
 
 # Run tests
-ctest -C Release --output-on-failure
-
-# Run benchmarks
-.\Release\benchmark_throughput.exe
-.\Release\benchmark_recall.exe > recall_results.csv
+cd build && ctest --output-on-failure
 ```
 
-### Linux/Mac Build
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-ctest --output-on-failure
-./benchmark_throughput
-./benchmark_recall > recall_results.csv
-```
+**Prerequisites:** C++17 compiler, CMake 3.10+, CPU with AVX2 (Intel Haswell 2013+ / AMD Ryzen 2017+)
 
 ---
 
-## 💻 Usage (Python)
+## REST API
 
-NanoDB provides native Python bindings (`pybind11`) for easy integration with AI pipelines.
+| Method | Endpoint | Body | Response |
+|--------|----------|------|----------|
+| `POST` | `/vectors` | `{"id": uint32, "vector": [float x 128], "metadata": "string"}` | `201 {"status": "ok", "id": 0}` |
+| `POST` | `/search` | `{"vector": [float x 128], "k": int}` | `200 {"results": [{"id", "distance", "metadata"}...]}` |
+| `DELETE` | `/vectors/:id` | — | `200 {"status": "ok", "id": 0}` |
+| `GET` | `/stats` | — | `200 {"element_count", "vector_dim", "metric"}` |
+
+---
+
+## Benchmarks
+
+> **Hardware:** Intel Core i7-12700H (14C/20T, 4.7 GHz boost) | 16GB DDR5-4800 | Windows 11  
+> **Config:** 128-dimensional float32 vectors, M=16, ef_construction=200
+
+| Metric | Single-Threaded | 8 Threads |
+|--------|----------------|-----------|
+| Insert throughput | ~2,200 TPS | **~6,500 TPS** |
+| Search latency | 0.15 ms | 0.15 ms |
+| Parallel speedup | 1.0x | **2.88x** |
+
+<details>
+<summary>Why is the multi-threaded speedup sublinear?</summary>
+
+Three factors limit scaling beyond ~3x on commodity hardware:
+
+1. **Lock contention on resize** — storage expansion events serialize under `global_resize_lock_`
+2. **Memory bandwidth saturation** — each insert writes ~2KB (Node struct), 8 threads saturate the bus
+3. **Cache thrashing** — concurrent neighbor reads cause cross-core cache invalidations
+
+This matches what FAISS and Milvus report for parallel index builds (3–5x on consumer hardware).
+</details>
+
+Reproduce with: `./build/benchmark_throughput` and `./build/benchmark_recall`
+
+---
+
+## Architecture
+
+```mermaid
+graph TD
+    A[REST API<br/>cpp-httplib] --> B[HNSW Index<br/>Hierarchical Graph]
+    B --> C[MMap Storage Engine<br/>Zero-Copy Disk Access]
+    B --> D[Metadata Store<br/>Append-Only Log]
+    B --> E[Distance Functions<br/>AVX2 SIMD]
+    F[Stripe SpinLocks] -.-> B
+
+    style A fill:#2d3748,stroke:#4fd1c5,color:#fff
+    style B fill:#2d3748,stroke:#4fd1c5,color:#fff
+    style C fill:#1a202c,stroke:#63b3ed,color:#fff
+    style D fill:#1a202c,stroke:#63b3ed,color:#fff
+    style E fill:#1a202c,stroke:#63b3ed,color:#fff
+    style F fill:#1a202c,stroke:#a0aec0,color:#fff
+```
+
+### Key Design Decisions
+
+**MMap Storage (Zero-Copy)** — The database file is memory-mapped into the process address space. The OS page cache handles eviction, allowing datasets larger than physical RAM. No `fread`/`fwrite` overhead.
+
+**Offset-Based Addressing** — Nodes are stored at `id * sizeof(Node)` offsets instead of absolute pointers. The file is relocatable — map it at any address and it works immediately with zero deserialization.
+
+**HNSW Graph** — Logarithmic search complexity O(log N). Layers are traversed top-down from sparse entry points to dense bottom-layer neighborhoods. ef_construction=200 gives high recall without excessive build time.
+
+**Stripe Locks** — Each node has its own SpinLock. Concurrent inserts only contend when modifying the same node's neighbor list. SpinLocks outperform `std::mutex` for critical sections under ~100ns.
+
+**Lazy Deletion** — Tombstone-based O(1) deletion. Deleted nodes are filtered at query time. Standard approach (same as FAISS IVF) — periodic compaction is the remedy for high delete ratios.
+
+---
+
+## Features
+
+- **HNSW indexing** — O(log N) approximate nearest neighbor search
+- **SIMD/AVX2 distance** — L2, Cosine, Inner Product with 4-8x speedup over scalar
+- **Memory-mapped persistence** — survives process restarts, handles datasets > RAM
+- **Thread-safe concurrent inserts** — fine-grained SpinLock striping
+- **Scalar quantization** — int8 quantization for 4x memory reduction (~1-5% recall loss)
+- **REST API** — deploy as a service with Docker
+- **Python bindings** — pybind11 for integration with ML pipelines
+- **Zero external dependencies** — no BLAS, no etcd, no message queues
+
+---
+
+## Python Bindings
 
 ```python
-import sys
-sys.path.insert(0, 'build/Release')  # or 'build' on Linux
 import nanodb
-import random
 
-# 1. Initialize DB
 storage = nanodb.MMapHandler()
-storage.open_file("data/index.ndb", 50 * 1024 * 1024)  # 50MB pre-allocation
+storage.open_file("data/index.ndb", 50 * 1024 * 1024)
 
-# Choose your distance metric:
-#   nanodb.DistanceMetric.L2           — general-purpose (default)
-#   nanodb.DistanceMetric.Cosine       — NLP embeddings
-#   nanodb.DistanceMetric.InnerProduct — recommendation systems
 index = nanodb.HNSW(storage, "data/meta.bin", nanodb.DistanceMetric.Cosine)
 
-# 2. Insert vectors
-vector = [random.random() for _ in range(128)]
-index.insert(vector, id=1, metadata="cat_photo.jpg")
+# Insert
+index.insert([0.1] * 128, id=0, metadata="photo.jpg")
 
-# 3. Search
-results = index.search(query=vector, k=5)
-for res in results:
-    print(f"ID: {res.id}  Distance: {res.distance:.4f}  Meta: {res.metadata}")
+# Search
+results = index.search(query=[0.1] * 128, k=5)
+for r in results:
+    print(f"ID={r.id}  dist={r.distance:.4f}  meta={r.metadata}")
 
-# 4. Delete (lazy tombstone)
-index.delete_vector(1)
-# Node 1 will no longer appear in search results
-
-# 5. Scalar Quantization (4x memory reduction)
-sq = nanodb.ScalarQuantizer()
-dataset = [[random.random() for _ in range(128)] for _ in range(1000)]
-sq.train(dataset)
-quantized = sq.quantize(vector)  # list of int8 values
-approx = sq.dequantize(quantized, 128)  # approximate float reconstruction
+# Delete
+index.delete_vector(0)
 
 storage.close_file()
 ```
 
----
-
-## 🧠 System Architecture
-
-### 1. The "MMap" Storage Engine (Zero-Copy)
-
-Most databases read files using `fread`, which copies data from Disk → Kernel Buffer → User RAM. This is slow and consumes physical memory immediately.
-
-**NanoDB uses Memory Mapped Files (mmap):**
-
-* **Lazy Loading:** The OS maps the file into the process's virtual address space but only loads physical **Pages (4KB)** when they are actually accessed.
-* **Huge Datasets:** This allows NanoDB to search a **100GB dataset on a machine with only 8GB of RAM**, relying on the OS page cache for memory management.
-
-### 2. Offset-Based Addressing (The "Pointer" Solution)
-
-A major challenge in C++ database design is that standard pointers (`Node*`) store **absolute memory addresses** (e.g., `0x7fff5b...`). If you save these to disk and reload them, the OS will likely load the file at a different address, making the pointers invalid.
-
-**The Solution:**
-Instead of absolute pointers, NanoDB uses **Relative Offsets** (e.g., "Node B is 1024 bytes from the start of the file").
-
-* **Portability:** The database file is "relocatable." It works instantly regardless of where it is loaded in memory.
-* **Zero Serialization:** We don't need to parse or convert data when opening the DB. We just map the file and start reading.
-
-### 3. The Index (HNSW)
-
-The graph is constructed with layers. Search starts at the sparse top layer (Layer L) and zooms in to the dense bottom layer (Layer 0), using the **Offset Manager** to traverse links between nodes.
-
-### 4. Why Stripe Locks Instead of a Single Mutex?
-
-A single global mutex would serialize every insert, making multi-threaded insertion equivalent to single-threaded. NanoDB assigns each node its own `SpinLock` (stored in a pre-allocated vector). When adding a link from node A to node B, only node A's lock is held — other threads can simultaneously modify unrelated nodes.
-
-**SpinLock vs `std::mutex`:** For short, predictable critical sections (updating a neighbor list takes ~100ns), spinning is faster than the OS context switch overhead of `std::mutex` (~1–5µs on Linux).
+Build with: `cmake -B build -DNANODB_BUILD_PYTHON=ON && cmake --build build`
 
 ---
 
-## 📜 License
+## Project Structure
 
-MIT License. Free to use and modify.
+```
+nano-db/
+├── include/
+│   ├── config/          Constants, types, utilities
+│   ├── concurrency/     SpinLock implementation
+│   ├── index/           HNSW graph, distance functions, quantizer
+│   └── storage/         MMap engine, metadata store, serializer
+├── src/
+│   ├── index/           Distance function implementations (AVX2)
+│   ├── storage/         MMap handler implementation
+│   ├── server.cpp       REST API server
+│   └── main.cpp         CLI demo
+├── tests/               Distance, HNSW, persistence tests
+├── benchmarks/          Throughput and recall benchmarks
+├── Dockerfile           Multi-stage production build
+└── docker-compose.yml   One-command local deployment
+```
+
+---
+
+## License
+
+MIT
