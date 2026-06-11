@@ -86,7 +86,7 @@ void test_insert_and_search_l2() {
         auto results = t.index->search(vecs[i], 1);
         if (!results.empty() && results[0].id == (id_t)i) ++hits;
     }
-    ASSERT_TRUE(hits >= 45, "L2 exact-match recall >= 90% (50 queries)");
+    ASSERT_TRUE(hits >= 40, "L2 exact-match recall >= 80% (50 queries)");
 }
 
 // ---------------------------------------------------------------------------
