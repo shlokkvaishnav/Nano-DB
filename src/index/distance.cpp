@@ -1,4 +1,4 @@
-#include "../../include/core/distance.hpp"
+#include "../../include/index/distance.hpp"
 #include <immintrin.h> // AVX2 intrinsics
 #include <cmath>
 

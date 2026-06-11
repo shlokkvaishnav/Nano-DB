@@ -7,11 +7,11 @@
 #include <set>
 #include <filesystem>
 
-#include "../include/common/config.hpp"
-#include "../include/common/types.hpp"
-#include "../include/storage/mmap_handler.hpp"
-#include "../include/core/hnsw.hpp"
-#include "../include/core/distance.hpp"
+#include "../include/config/constants.hpp"
+#include "../include/config/types.hpp"
+#include "../include/storage/memory_map.hpp"
+#include "../include/index/hnsw.hpp"
+#include "../include/index/distance.hpp"
 
 // ============================================================================
 // NanoDB Recall vs. Latency Benchmark

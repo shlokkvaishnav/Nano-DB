@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include "../include/core/hnsw.hpp"
-#include "../include/core/quantizer.hpp"
+#include "../include/index/hnsw.hpp"
+#include "../include/index/quantizer.hpp"
 
 namespace py = pybind11;
 using namespace nanodb;

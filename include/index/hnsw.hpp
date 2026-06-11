@@ -1,11 +1,11 @@
 #pragma once
 
-#include "node.hpp"
+#include "graph_node.hpp"
 #include "distance.hpp"
-#include "../common/config.hpp"
-#include "../storage/mmap_handler.hpp"
-#include "../common/spinlock.hpp"
-#include "../storage/metadata_handler.hpp"
+#include "../config/constants.hpp"
+#include "../storage/memory_map.hpp"
+#include "../concurrency/spinlock.hpp"
+#include "../storage/metadata_store.hpp"
 #include <queue>
 #include <vector>
 #include <random>

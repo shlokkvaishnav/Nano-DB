@@ -5,7 +5,7 @@
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
-#include "../common/types.hpp"
+#include "../config/types.hpp"
 
 namespace nanodb {
 

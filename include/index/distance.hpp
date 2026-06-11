@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstddef>
-#include "../common/types.hpp"
+#include "../config/types.hpp"
 
 namespace nanodb {
 

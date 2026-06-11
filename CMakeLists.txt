@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
 project(NanoDB VERSION 1.0.0 LANGUAGES CXX)
 
+# Build options
+option(NANODB_BUILD_SERVER "Build the REST API server" ON)
+option(NANODB_BUILD_PYTHON "Build the Python bindings" ON)
+
 # Settings
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,8 +20,8 @@ find_package(OpenMP REQUIRED)
 
 # Create the Core Library
 add_library(nano_core OBJECT
-    src/core/distance.cpp
-    src/storage/mmap_handler.cpp
+    src/index/distance.cpp
+    src/storage/memory_map.cpp
 )
 target_include_directories(nano_core PUBLIC include)
 
@@ -26,10 +30,25 @@ add_executable(nano_db src/main.cpp)
 target_link_libraries(nano_db PRIVATE nano_core OpenMP::OpenMP_CXX)
 
 # Build the Python Module
-add_subdirectory(extern/pybind11)
-pybind11_add_module(nanodb_py src/python_bindings.cpp)
-target_link_libraries(nanodb_py PRIVATE nano_core OpenMP::OpenMP_CXX)
-set_target_properties(nanodb_py PROPERTIES OUTPUT_NAME "nanodb")
+if(NANODB_BUILD_PYTHON)
+    add_subdirectory(extern/pybind11)
+    pybind11_add_module(nanodb_py src/python_bindings.cpp)
+    target_link_libraries(nanodb_py PRIVATE nano_core OpenMP::OpenMP_CXX)
+    set_target_properties(nanodb_py PROPERTIES OUTPUT_NAME "nanodb")
+endif()
+
+# Build the REST API Server
+if(NANODB_BUILD_SERVER)
+    add_executable(nano_server src/server.cpp)
+    target_include_directories(nano_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/extern/httplib
+        ${CMAKE_SOURCE_DIR}/include/third_party
+    )
+    target_link_libraries(nano_server PRIVATE nano_core OpenMP::OpenMP_CXX)
+    if(WIN32)
+        target_link_libraries(nano_server PRIVATE ws2_32)
+    endif()
+endif()
 
 # ---- Benchmarks ----
 add_executable(benchmark_throughput benchmarks/benchmark_throughput.cpp)

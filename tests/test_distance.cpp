@@ -4,8 +4,8 @@
 #include <vector>
 #include <string>
 
-#include "../include/core/distance.hpp"
-#include "../include/common/types.hpp"
+#include "../include/index/distance.hpp"
+#include "../include/config/types.hpp"
 
 // Simple test framework
 static int tests_run = 0;

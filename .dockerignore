@@ -1,5 +1,7 @@
 build/
+.git/
 .vs/
+.vscode/
 *.exe
 *.pdb
 data/

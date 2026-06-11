@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../common/types.hpp"
-#include "../common/config.hpp"
+#include "../config/types.hpp"
+#include "../config/constants.hpp"
 #include <cstring>
 #include <vector>
 

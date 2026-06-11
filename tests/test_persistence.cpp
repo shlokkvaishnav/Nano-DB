@@ -5,10 +5,10 @@
 #include <filesystem>
 #include <string>
 
-#include "../include/common/config.hpp"
-#include "../include/common/types.hpp"
-#include "../include/storage/mmap_handler.hpp"
-#include "../include/core/hnsw.hpp"
+#include "../include/config/constants.hpp"
+#include "../include/config/types.hpp"
+#include "../include/storage/memory_map.hpp"
+#include "../include/index/hnsw.hpp"
 
 static int tests_run = 0;
 static int tests_failed = 0;
