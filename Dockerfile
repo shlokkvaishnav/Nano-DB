@@ -6,7 +6,10 @@ RUN apt-get update && apt-get install -y cmake git
 WORKDIR /app
 COPY . .
 
-RUN git submodule update --init --recursive
+RUN if [ ! -d "extern/httplib/.git" ] && [ ! -f "extern/httplib/CMakeLists.txt" ]; then \
+        rm -rf extern/httplib && \
+        git clone --depth 1 https://github.com/yhirose/cpp-httplib.git extern/httplib; \
+    fi
 
 RUN mkdir build && cd build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
