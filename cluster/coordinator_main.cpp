@@ -26,6 +26,8 @@ using json = nlohmann::json;
 using namespace nanodb::cluster;
 
 static httplib::Server* g_server = nullptr;
+static std::unique_ptr<nanodb::raft::RaftNode> g_raft_node;
+static grpc::Server* g_raft_server = nullptr;
 static constexpr int RPC_TIMEOUT_MS = 800;
 static constexpr int MIGRATION_RPC_TIMEOUT_MS = 2000;
 
@@ -58,8 +60,6 @@ static std::vector<std::unique_ptr<ShardClient>> g_shards;
 static HashRing active_ring;
 static std::atomic<bool> rebalancing{false};
 static std::string g_cluster_config_path;
-static std::unique_ptr<nanodb::raft::RaftNode> g_raft_node;
-static grpc::Server* g_raft_server = nullptr;
 
 static std::unique_ptr<ShardClient> make_shard_client(int shard_id, const std::string& host, int port) {
     auto sc = std::make_unique<ShardClient>();
