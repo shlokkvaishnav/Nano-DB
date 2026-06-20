@@ -190,7 +190,9 @@ int main() {
             return 1;
         }
 
-        g_raft_node = std::make_unique<nanodb::raft::RaftNode>(raft_node_id, raft_peers, raft_state_path);
+        const char* raft_log_env = std::getenv("NANODB_RAFT_LOG_PATH");
+        std::string raft_log_path = raft_log_env ? raft_log_env : "raft_log.bin";
+        g_raft_node = std::make_unique<nanodb::raft::RaftNode>(raft_node_id, raft_peers, raft_state_path, raft_log_path);
         raft_service = std::make_unique<nanodb::raft::RaftServiceImpl>(*g_raft_node);
 
         grpc::ServerBuilder raft_builder;
@@ -393,7 +395,21 @@ int main() {
         }
         auto st = g_raft_node->status();
         json response = {{"node_id", st.node_id}, {"role", st.role},
-                          {"term", st.term}, {"leader_id", st.leader_id}};
+                          {"term", st.term}, {"leader_id", st.leader_id},
+                          {"log_length", st.log_length}, {"commit_index", st.commit_index},
+                          {"applied_commands", st.applied_commands}};
+        res.set_content(response.dump(), "application/json");
+    });
+
+    server.Post("/raft/propose", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!g_raft_node) {
+            res.status = 404;
+            res.set_content(R"({"error":"raft is not enabled on this coordinator"})", "application/json");
+            return;
+        }
+        bool ok = g_raft_node->propose(req.body);
+        json response = {{"committed", ok}};
+        res.status = ok ? 200 : 503;
         res.set_content(response.dump(), "application/json");
     });
 
