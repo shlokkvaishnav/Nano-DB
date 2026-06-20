@@ -31,10 +31,13 @@ static grpc::Server* g_raft_server = nullptr;
 static constexpr int RPC_TIMEOUT_MS = 800;
 static constexpr int MIGRATION_RPC_TIMEOUT_MS = 2000;
 
+static std::atomic<bool> g_apply_poller_running{false};
+
 void signal_handler(int) {
     if (g_server) g_server->stop();
     if (g_raft_node) g_raft_node->stop();
     if (g_raft_server) g_raft_server->Shutdown();
+    g_apply_poller_running = false;
 }
 
 struct ShardClient {
@@ -60,6 +63,13 @@ static std::vector<std::unique_ptr<ShardClient>> g_shards;
 static HashRing active_ring;
 static std::atomic<bool> rebalancing{false};
 static std::string g_cluster_config_path;
+
+// Serializes apply_pending_raft_commands() across callers (the dedicated
+// poller thread and any admin handler doing a synchronous catch-up after
+// its own propose() commits), and tracks how many of RaftNode's applied
+// commands have already been reflected in g_shards/active_ring.
+static std::mutex g_apply_mutex;
+static uint64_t g_local_applied_count = 0;
 
 static std::unique_ptr<ShardClient> make_shard_client(int shard_id, const std::string& host, int port) {
     auto sc = std::make_unique<ShardClient>();
@@ -104,6 +114,71 @@ static void persist_cluster_state() {
     } catch (const std::exception& e) {
         std::cerr << "[Coordinator] WARNING: failed to persist cluster config: " << e.what() << std::endl;
     }
+}
+
+// The Phase 3c state machine: applies any newly Raft-committed
+// AddShard/RemoveShard commands to g_shards/active_ring. Safe to call from
+// any node regardless of role (followers need this too, to keep their own
+// view in sync) and safe to call redundantly (no-ops if nothing new).
+// Called both by a dedicated background poller (so followers stay in sync
+// passively) and synchronously by the leader's admin handlers right after
+// their own propose() commits, so migration logic never has to wait for
+// the poller's cadence to see the change it just made.
+//
+// RemoveShard intentionally does NOT need special-case handling for
+// "migration not done yet": by design (see coordinator_main.cpp's
+// /admin/shards/remove), the leader only proposes RemoveShard AFTER
+// migration has already completed, so by the time any node -- leader or
+// follower -- applies this command, it's always safe to immediately
+// exclude the shard from search/stats (active=false) as well as from
+// future write routing (active_ring). There's no version of this command
+// that gets applied before its data has moved.
+static void apply_pending_raft_commands() {
+    if (!g_raft_node) return;
+    std::lock_guard<std::mutex> apply_lock(g_apply_mutex);
+    auto st = g_raft_node->status();
+    if (st.applied_commands.size() <= g_local_applied_count) return;
+
+    for (uint64_t i = g_local_applied_count; i < st.applied_commands.size(); i++) {
+        try {
+            json cmd = json::parse(st.applied_commands[i]);
+            std::string type = cmd.at("type").get<std::string>();
+
+            if (type == "add_shard") {
+                int shard_id = cmd.at("shard_id").get<int>();
+                std::string host = cmd.at("host").get<std::string>();
+                int port = cmd.at("port").get<int>();
+
+                bool exists = false;
+                {
+                    std::shared_lock lock(cluster_mutex);
+                    for (auto& sc : g_shards) if (sc->shard_id == shard_id) exists = true;
+                }
+                if (!exists) {
+                    auto new_client = make_shard_client(shard_id, host, port);
+                    std::unique_lock lock(cluster_mutex);
+                    g_shards.push_back(std::move(new_client));
+                    std::vector<int> ids;
+                    for (auto& sc : g_shards) if (sc->active) ids.push_back(sc->shard_id);
+                    active_ring.build(ids);
+                }
+            } else if (type == "remove_shard") {
+                int shard_id = cmd.at("shard_id").get<int>();
+                std::unique_lock lock(cluster_mutex);
+                for (auto& sc : g_shards) {
+                    if (sc->shard_id == shard_id) sc->active = false;
+                }
+                std::vector<int> ids;
+                for (auto& sc : g_shards) if (sc->active) ids.push_back(sc->shard_id);
+                active_ring.build(ids);
+            } else {
+                std::cerr << "[Coordinator] WARNING: unknown raft command type \"" << type << "\"" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Coordinator] WARNING: failed to apply raft command #" << i << ": " << e.what() << std::endl;
+        }
+    }
+    g_local_applied_count = st.applied_commands.size();
 }
 
 // Moves one key from source to dest. Insert-into-destination happens before
@@ -209,6 +284,17 @@ int main() {
     } else {
         std::cout << "[Coordinator] Raft disabled (set NANODB_RAFT_NODE_ID and "
                      "NANODB_RAFT_PEERS_CONFIG to enable)" << std::endl;
+    }
+
+    std::thread apply_poller_thread;
+    if (g_raft_node) {
+        g_apply_poller_running = true;
+        apply_poller_thread = std::thread([&]() {
+            while (g_apply_poller_running) {
+                apply_pending_raft_commands();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        });
     }
 
     httplib::Server server;
@@ -415,6 +501,19 @@ int main() {
 
     // POST /admin/shards/add  body: {"shard_id": 3, "host": "shard-3", "port": 9090}
     server.Post("/admin/shards/add", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!g_raft_node) {
+            res.status = 400;
+            res.set_content(R"({"error":"raft is not enabled on this coordinator"})", "application/json");
+            return;
+        }
+        auto raft_st = g_raft_node->status();
+        if (raft_st.role != "leader") {
+            res.status = 503;
+            json err = {{"error", "not the leader"}, {"leader_id", raft_st.leader_id}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
         bool expected = false;
         if (!rebalancing.compare_exchange_strong(expected, true)) {
             res.status = 409;
@@ -427,17 +526,27 @@ int main() {
             std::string host = body.at("host").get<std::string>();
             int port = body.at("port").get<int>();
 
-            auto new_client = make_shard_client(new_id, host, port);
-            ShardClient* new_ptr = new_client.get();
-            {
-                std::unique_lock lock(cluster_mutex);
-                g_shards.push_back(std::move(new_client));
+            // Propose first: a shard can't be migrated TO until it has a
+            // ShardClient/stub, which only exists once the AddShard command
+            // has actually been applied.
+            json cmd = {{"type", "add_shard"}, {"shard_id", new_id}, {"host", host}, {"port", port}};
+            if (!g_raft_node->propose(cmd.dump())) {
+                rebalancing = false;
+                res.status = 503;
+                res.set_content(R"({"error":"raft proposal did not commit, lost leadership or timed out"})", "application/json");
+                return;
             }
+            apply_pending_raft_commands(); // don't wait for the poller's cadence
 
-            auto pool = live_shards(); // includes the new shard now
-            std::vector<int> ids2;
-            for (auto* sc : pool) ids2.push_back(sc->shard_id);
-            HashRing new_ring(ids2);
+            auto pool = live_shards();
+            ShardClient* new_ptr = find_shard(pool, new_id);
+            if (!new_ptr) {
+                rebalancing = false;
+                res.status = 500;
+                res.set_content(R"({"error":"committed via raft but not present locally after apply -- this should not happen"})", "application/json");
+                return;
+            }
+            HashRing new_ring = ring_snapshot();
 
             int migrated = 0, failed = 0;
             for (auto* source : pool) {
@@ -455,10 +564,6 @@ int main() {
                 }
             }
 
-            {
-                std::unique_lock lock(cluster_mutex);
-                active_ring = new_ring;
-            }
             persist_cluster_state();
             rebalancing = false;
 
@@ -474,6 +579,19 @@ int main() {
 
     // POST /admin/shards/remove  body: {"shard_id": 1}
     server.Post("/admin/shards/remove", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!g_raft_node) {
+            res.status = 400;
+            res.set_content(R"({"error":"raft is not enabled on this coordinator"})", "application/json");
+            return;
+        }
+        auto raft_st = g_raft_node->status();
+        if (raft_st.role != "leader") {
+            res.status = 503;
+            json err = {{"error", "not the leader"}, {"leader_id", raft_st.leader_id}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
         bool expected = false;
         if (!rebalancing.compare_exchange_strong(expected, true)) {
             res.status = 409;
@@ -492,39 +610,49 @@ int main() {
                 res.set_content(R"({"error":"shard not found or already inactive"})", "application/json");
                 return;
             }
-
-            std::vector<int> remaining_ids;
-            for (auto* sc : pool) if (sc->shard_id != leaving_id) remaining_ids.push_back(sc->shard_id);
-            if (remaining_ids.empty()) {
+            if (pool.size() <= 1) {
                 rebalancing = false;
                 res.status = 400;
                 res.set_content(R"({"error":"cannot remove the last shard"})", "application/json");
                 return;
             }
-            // The leaving shard is excluded from the new ring immediately, but
-            // stays `active` (still serving reads, still the migration source)
-            // until every key it owns has actually moved.
-            HashRing new_ring(remaining_ids);
 
+            // Migrate BEFORE proposing, deliberately: the leaving shard
+            // already has a live stub (it's still in g_shards), so unlike
+            // AddShard there's no technical need to commit first. Moving
+            // the data first and proposing RemoveShard as the atomic
+            // "officially gone" declaration afterward means that by the
+            // time ANY node -- leader or follower -- applies this command,
+            // the migration is already done, so it's always safe for that
+            // application to immediately mark the shard inactive (excluded
+            // from search/stats) with no window where data is invisible
+            // because it's "removed" on paper but not actually moved yet.
+            std::vector<int> remaining_ids;
+            for (auto* sc : pool) if (sc->shard_id != leaving_id) remaining_ids.push_back(sc->shard_id);
+            HashRing post_remove_ring(remaining_ids);
+
+            int migrated = 0, failed = 0;
             ListLocalIdsRequest lreq;
             grpc::ClientContext lctx;
             lctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
             ListLocalIdsResponse lres;
-            int migrated = 0, failed = 0;
             if (leaving->stub->ListLocalIds(&lctx, lreq, &lres).ok()) {
                 for (const auto& external_id : lres.external_ids()) {
-                    ShardClient* dest = find_shard(pool, new_ring.route(external_id));
+                    ShardClient* dest = find_shard(pool, post_remove_ring.route(external_id));
                     if (!dest) { failed++; continue; }
                     if (migrate_one_key(*leaving, *dest, external_id)) migrated++;
                     else failed++;
                 }
             }
 
-            {
-                std::unique_lock lock(cluster_mutex);
-                active_ring = new_ring;
+            json cmd = {{"type", "remove_shard"}, {"shard_id", leaving_id}};
+            if (!g_raft_node->propose(cmd.dump())) {
+                rebalancing = false;
+                res.status = 503;
+                res.set_content(R"({"error":"data was migrated but the raft proposal to finalize removal did not commit -- retry the remove, migration is idempotent"})", "application/json");
+                return;
             }
-            leaving->active = false;
+            apply_pending_raft_commands();
             persist_cluster_state();
             rebalancing = false;
 
@@ -541,6 +669,7 @@ int main() {
     std::cout << "[Coordinator] Listening on 0.0.0.0:" << http_port << std::endl;
     server.listen("0.0.0.0", http_port);
     if (raft_server_thread.joinable()) raft_server_thread.join();
+    if (apply_poller_thread.joinable()) apply_poller_thread.join();
     std::cout << "[Coordinator] Stopped." << std::endl;
     return 0;
 }

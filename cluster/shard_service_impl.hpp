@@ -79,7 +79,20 @@ public:
     grpc::Status ListLocalIds(grpc::ServerContext*, const ListLocalIdsRequest*,
                                ListLocalIdsResponse* response) override {
         for (const auto& id : id_map_.list_all_external_ids()) {
-            response->add_external_ids(id);
+            uint32_t local_id;
+            // IdMapStore's mapping never gets removed on delete (only the
+            // underlying HNSW node gets tombstoned), so a key that's
+            // already been migrated away from this shard -- delete_vector
+            // was called on it as the last step of a prior migration --
+            // would otherwise still show up here every time ListLocalIds
+            // is called again. That makes a second rebalance operation
+            // re-attempt migrating already-gone keys, which then fail at
+            // GetVector (the tombstoned node returns no data) and get
+            // miscounted as real failures instead of being silently
+            // skipped, exactly what they should be.
+            if (id_map_.lookup(id, local_id) && !index_.is_deleted(local_id)) {
+                response->add_external_ids(id);
+            }
         }
         response->set_ok(true);
         return grpc::Status::OK;

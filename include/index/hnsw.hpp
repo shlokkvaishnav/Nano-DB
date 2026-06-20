@@ -227,7 +227,12 @@ namespace nanodb {
             size_t offset = HEADER_SIZE + (size_t)id * sizeof(Node);
             if (offset + sizeof(Node) > storage_.get_size()) return;
             Node* node = get_node(id);
-            node->is_deleted = true;
+            if (!node->is_deleted) {
+                node->is_deleted = true;
+                #pragma omp atomic
+                element_count_--;
+                persist_header();
+            }
         }
 
         // Helper: retrieve metadata string for a given ID
