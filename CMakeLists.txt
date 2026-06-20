@@ -98,6 +98,36 @@ if(NANODB_BUILD_CLUSTER)
         ${CMAKE_SOURCE_DIR}/include/third_party
     )
     target_link_libraries(nano_coordinator PRIVATE nano_core nanodb_proto OpenMP::OpenMP_CXX)
+
+    # ---- Raft control-plane RPC (Phase 3) ----
+    set(NANODB_RAFT_PROTO_FILE ${CMAKE_SOURCE_DIR}/proto/raft.proto)
+    set(NANODB_RAFT_PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated_raft)
+    file(MAKE_DIRECTORY ${NANODB_RAFT_PROTO_GEN_DIR})
+
+    add_custom_command(
+        OUTPUT
+            "${NANODB_RAFT_PROTO_GEN_DIR}/raft.pb.cc"
+            "${NANODB_RAFT_PROTO_GEN_DIR}/raft.pb.h"
+            "${NANODB_RAFT_PROTO_GEN_DIR}/raft.grpc.pb.cc"
+            "${NANODB_RAFT_PROTO_GEN_DIR}/raft.grpc.pb.h"
+        COMMAND protobuf::protoc
+        ARGS --grpc_out "${NANODB_RAFT_PROTO_GEN_DIR}"
+             --cpp_out "${NANODB_RAFT_PROTO_GEN_DIR}"
+             -I "${CMAKE_SOURCE_DIR}/proto"
+             --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN_LOCATION}"
+             "${NANODB_RAFT_PROTO_FILE}"
+        DEPENDS "${NANODB_RAFT_PROTO_FILE}"
+    )
+
+    add_library(nanodb_raft_proto OBJECT
+        ${NANODB_RAFT_PROTO_GEN_DIR}/raft.pb.cc
+        ${NANODB_RAFT_PROTO_GEN_DIR}/raft.grpc.pb.cc
+    )
+    target_include_directories(nanodb_raft_proto PUBLIC ${NANODB_RAFT_PROTO_GEN_DIR})
+    target_link_libraries(nanodb_raft_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+
+    target_link_libraries(nano_coordinator PRIVATE nanodb_raft_proto)
+    target_include_directories(nano_coordinator PRIVATE ${NANODB_RAFT_PROTO_GEN_DIR})
 endif()
 
 # ---- Benchmarks ----

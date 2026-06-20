@@ -1,0 +1,7 @@
+{
+  "peers": [
+    {"node_id": 0, "host": "coordinator-0", "raft_port": 7100},
+    {"node_id": 1, "host": "coordinator-1", "raft_port": 7100},
+    {"node_id": 2, "host": "coordinator-2", "raft_port": 7100}
+  ]
+}

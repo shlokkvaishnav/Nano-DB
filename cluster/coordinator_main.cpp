@@ -18,6 +18,9 @@
 #include "cluster_config.hpp"
 #include "routing.hpp"
 #include "hash_ring.hpp"
+#include "raft_node.hpp"
+#include "raft_config.hpp"
+#include "raft_service_impl.hpp"
 
 using json = nlohmann::json;
 using namespace nanodb::cluster;
@@ -28,6 +31,8 @@ static constexpr int MIGRATION_RPC_TIMEOUT_MS = 2000;
 
 void signal_handler(int) {
     if (g_server) g_server->stop();
+    if (g_raft_node) g_raft_node->stop();
+    if (g_raft_server) g_raft_server->Shutdown();
 }
 
 struct ShardClient {
@@ -53,6 +58,8 @@ static std::vector<std::unique_ptr<ShardClient>> g_shards;
 static HashRing active_ring;
 static std::atomic<bool> rebalancing{false};
 static std::string g_cluster_config_path;
+static std::unique_ptr<nanodb::raft::RaftNode> g_raft_node;
+static grpc::Server* g_raft_server = nullptr;
 
 static std::unique_ptr<ShardClient> make_shard_client(int shard_id, const std::string& host, int port) {
     auto sc = std::make_unique<ShardClient>();
@@ -152,6 +159,55 @@ int main() {
     }
     active_ring.build(ids);
     std::cout << "[Coordinator] Loaded " << g_shards.size() << " shard(s) from " << g_cluster_config_path << std::endl;
+
+    std::unique_ptr<nanodb::raft::RaftServiceImpl> raft_service;
+    std::unique_ptr<grpc::Server> raft_server;
+    std::thread raft_server_thread;
+
+    const char* raft_node_id_env = std::getenv("NANODB_RAFT_NODE_ID");
+    const char* raft_peers_env = std::getenv("NANODB_RAFT_PEERS_CONFIG");
+    if (raft_node_id_env && raft_peers_env) {
+        int raft_node_id = std::atoi(raft_node_id_env);
+        const char* raft_state_env = std::getenv("NANODB_RAFT_STATE_PATH");
+        std::string raft_state_path = raft_state_env ? raft_state_env : "raft_state.bin";
+
+        std::vector<nanodb::raft::RaftPeer> raft_peers;
+        try {
+            raft_peers = nanodb::raft::load_raft_peers(raft_peers_env);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] " << e.what() << std::endl;
+            return 1;
+        }
+
+        nanodb::raft::RaftPeer self_peer;
+        bool found_self = false;
+        for (auto& p : raft_peers) {
+            if (p.node_id == raft_node_id) { self_peer = p; found_self = true; }
+        }
+        if (!found_self) {
+            std::cerr << "[ERROR] NANODB_RAFT_NODE_ID=" << raft_node_id
+                      << " not present in " << raft_peers_env << std::endl;
+            return 1;
+        }
+
+        g_raft_node = std::make_unique<nanodb::raft::RaftNode>(raft_node_id, raft_peers, raft_state_path);
+        raft_service = std::make_unique<nanodb::raft::RaftServiceImpl>(*g_raft_node);
+
+        grpc::ServerBuilder raft_builder;
+        raft_builder.AddListeningPort(self_peer.host + ":" + std::to_string(self_peer.port),
+                                       grpc::InsecureServerCredentials());
+        raft_builder.RegisterService(raft_service.get());
+        raft_server = raft_builder.BuildAndStart();
+        g_raft_server = raft_server.get();
+        raft_server_thread = std::thread([&raft_server]() { raft_server->Wait(); });
+
+        g_raft_node->start();
+        std::cout << "[Coordinator] Raft node " << raft_node_id << " listening on "
+                  << self_peer.host << ":" << self_peer.port << std::endl;
+    } else {
+        std::cout << "[Coordinator] Raft disabled (set NANODB_RAFT_NODE_ID and "
+                     "NANODB_RAFT_PEERS_CONFIG to enable)" << std::endl;
+    }
 
     httplib::Server server;
     g_server = &server;
@@ -329,6 +385,18 @@ int main() {
         res.set_content(response.dump(), "application/json");
     });
 
+    server.Get("/raft/status", [&](const httplib::Request&, httplib::Response& res) {
+        if (!g_raft_node) {
+            res.status = 404;
+            res.set_content(R"({"error":"raft is not enabled on this coordinator"})", "application/json");
+            return;
+        }
+        auto st = g_raft_node->status();
+        json response = {{"node_id", st.node_id}, {"role", st.role},
+                          {"term", st.term}, {"leader_id", st.leader_id}};
+        res.set_content(response.dump(), "application/json");
+    });
+
     // POST /admin/shards/add  body: {"shard_id": 3, "host": "shard-3", "port": 9090}
     server.Post("/admin/shards/add", [&](const httplib::Request& req, httplib::Response& res) {
         bool expected = false;
@@ -456,6 +524,7 @@ int main() {
 
     std::cout << "[Coordinator] Listening on 0.0.0.0:" << http_port << std::endl;
     server.listen("0.0.0.0", http_port);
+    if (raft_server_thread.joinable()) raft_server_thread.join();
     std::cout << "[Coordinator] Stopped." << std::endl;
     return 0;
 }
