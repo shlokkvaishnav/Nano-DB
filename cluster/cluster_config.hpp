@@ -10,8 +10,10 @@ namespace cluster {
 
 struct ShardEndpoint {
     int shard_id;
+    int replica_id;
     std::string host;
     int port;
+    bool is_primary;
     std::string address() const { return host + ":" + std::to_string(port); }
 };
 
@@ -26,8 +28,10 @@ inline std::vector<ShardEndpoint> load_cluster_config(const std::string& path) {
     for (const auto& s : j.at("shards")) {
         ShardEndpoint ep;
         ep.shard_id = s.at("shard_id").get<int>();
+        ep.replica_id = s.value("replica_id", 0);
         ep.host = s.at("host").get<std::string>();
         ep.port = s.at("port").get<int>();
+        ep.is_primary = s.value("primary", true);
         shards.push_back(ep);
     }
     if (shards.empty()) throw std::runtime_error("cluster config has zero shards");
@@ -40,8 +44,10 @@ inline void save_cluster_config(const std::string& path, const std::vector<Shard
     for (const auto& ep : shards) {
         j["shards"].push_back({
             {"shard_id", ep.shard_id},
+            {"replica_id", ep.replica_id},
             {"host", ep.host},
-            {"port", ep.port}
+            {"port", ep.port},
+            {"primary", ep.is_primary}
         });
     }
     std::ofstream f(path);

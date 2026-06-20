@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <set>
+#include <map>
 
 #include "httplib.h"
 #include "json.hpp"
@@ -42,11 +43,13 @@ void signal_handler(int) {
 
 struct ShardClient {
     int shard_id;
+    int replica_id;
     std::string host;
     int port;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<ShardService::Stub> stub;
     std::atomic<bool> active{true};
+    std::atomic<bool> is_primary{false};
 };
 
 // All cluster membership state lives behind this lock. Readers (the normal
@@ -71,13 +74,15 @@ static std::string g_cluster_config_path;
 static std::mutex g_apply_mutex;
 static uint64_t g_local_applied_count = 0;
 
-static std::unique_ptr<ShardClient> make_shard_client(int shard_id, const std::string& host, int port) {
+static std::unique_ptr<ShardClient> make_shard_client(int shard_id, int replica_id, const std::string& host, int port, bool is_primary) {
     auto sc = std::make_unique<ShardClient>();
     sc->shard_id = shard_id;
+    sc->replica_id = replica_id;
     sc->host = host;
     sc->port = port;
     sc->channel = grpc::CreateChannel(host + ":" + std::to_string(port), grpc::InsecureChannelCredentials());
     sc->stub = ShardService::NewStub(sc->channel);
+    sc->is_primary = is_primary;
     return sc;
 }
 
@@ -97,17 +102,54 @@ static HashRing ring_snapshot() {
     return active_ring;
 }
 
-static ShardClient* find_shard(const std::vector<ShardClient*>& pool, int shard_id) {
-    for (auto* sc : pool) {
-        if (sc->shard_id == shard_id) return sc;
-    }
+// All active replicas of one shard_id, primary first if present. A shard_id
+// now maps to a SET of physical nodes, not one -- this is the thing every
+// write fans out to and every quorum is computed over.
+static std::vector<ShardClient*> replicas_for_shard(const std::vector<ShardClient*>& pool, int shard_id) {
+    std::vector<ShardClient*> out;
+    for (auto* sc : pool) if (sc->shard_id == shard_id) out.push_back(sc);
+    std::sort(out.begin(), out.end(), [](ShardClient* a, ShardClient* b) {
+        return a->is_primary && !b->is_primary;
+    });
+    return out;
+}
+
+static ShardClient* find_primary(const std::vector<ShardClient*>& pool, int shard_id) {
+    for (auto* sc : pool) if (sc->shard_id == shard_id && sc->is_primary) return sc;
     return nullptr;
+}
+
+// One representative replica per distinct shard_id, for reads. "strong"
+// always picks the primary -- if the primary isn't currently active, that
+// shard is reported unavailable rather than silently reading a replica,
+// since the primary is the only replica reads can be sure isn't stale at
+// the moment writes stop going through it (see Phase 4b's epoch fencing
+// for the runtime-primary-change case this doesn't yet have to handle).
+// "eventual" prefers a non-primary replica when one's available, both to
+// demonstrate genuine load distribution away from the primary and because
+// there's no consistency reason to prefer it once staleness is accepted.
+static std::vector<ShardClient*> select_read_targets(const std::vector<ShardClient*>& pool, const std::string& consistency) {
+    std::map<int, std::vector<ShardClient*>> by_shard;
+    for (auto* sc : pool) by_shard[sc->shard_id].push_back(sc);
+
+    std::vector<ShardClient*> out;
+    for (auto& [shard_id, replicas] : by_shard) {
+        ShardClient* chosen = nullptr;
+        if (consistency == "strong") {
+            for (auto* r : replicas) if (r->is_primary) chosen = r;
+        } else {
+            for (auto* r : replicas) if (!r->is_primary) { chosen = r; break; }
+            if (!chosen && !replicas.empty()) chosen = replicas.front();
+        }
+        if (chosen) out.push_back(chosen);
+    }
+    return out;
 }
 
 static void persist_cluster_state() {
     std::vector<ShardEndpoint> eps;
     for (auto* sc : live_shards()) {
-        eps.push_back({sc->shard_id, sc->host, sc->port});
+        eps.push_back({sc->shard_id, sc->replica_id, sc->host, sc->port, sc->is_primary.load()});
     }
     try {
         save_cluster_config(g_cluster_config_path, eps);
@@ -116,7 +158,7 @@ static void persist_cluster_state() {
     }
 }
 
-// The Phase 3c state machine: applies any newly Raft-committed
+// The Phase 4a state machine: applies any newly Raft-committed
 // AddShard/RemoveShard commands to g_shards/active_ring. Safe to call from
 // any node regardless of role (followers need this too, to keep their own
 // view in sync) and safe to call redundantly (no-ops if nothing new).
@@ -125,14 +167,11 @@ static void persist_cluster_state() {
 // their own propose() commits, so migration logic never has to wait for
 // the poller's cadence to see the change it just made.
 //
-// RemoveShard intentionally does NOT need special-case handling for
-// "migration not done yet": by design (see coordinator_main.cpp's
-// /admin/shards/remove), the leader only proposes RemoveShard AFTER
-// migration has already completed, so by the time any node -- leader or
-// follower -- applies this command, it's always safe to immediately
-// exclude the shard from search/stats (active=false) as well as from
-// future write routing (active_ring). There's no version of this command
-// that gets applied before its data has moved.
+// add_shard now carries a full list of replicas (one shard_id -> N
+// physical nodes, one marked primary), not a single endpoint -- this is
+// the data-model shift Phase 4 makes. remove_shard is unchanged from 3c:
+// the leader only proposes it after migration has already completed, so
+// applying it is always safe to do immediately on any node.
 static void apply_pending_raft_commands() {
     if (!g_raft_node) return;
     std::lock_guard<std::mutex> apply_lock(g_apply_mutex);
@@ -146,8 +185,6 @@ static void apply_pending_raft_commands() {
 
             if (type == "add_shard") {
                 int shard_id = cmd.at("shard_id").get<int>();
-                std::string host = cmd.at("host").get<std::string>();
-                int port = cmd.at("port").get<int>();
 
                 bool exists = false;
                 {
@@ -155,12 +192,20 @@ static void apply_pending_raft_commands() {
                     for (auto& sc : g_shards) if (sc->shard_id == shard_id) exists = true;
                 }
                 if (!exists) {
-                    auto new_client = make_shard_client(shard_id, host, port);
+                    std::vector<std::unique_ptr<ShardClient>> new_clients;
+                    for (const auto& r : cmd.at("replicas")) {
+                        new_clients.push_back(make_shard_client(
+                            shard_id,
+                            r.at("replica_id").get<int>(),
+                            r.at("host").get<std::string>(),
+                            r.at("port").get<int>(),
+                            r.value("primary", false)));
+                    }
                     std::unique_lock lock(cluster_mutex);
-                    g_shards.push_back(std::move(new_client));
-                    std::vector<int> ids;
-                    for (auto& sc : g_shards) if (sc->active) ids.push_back(sc->shard_id);
-                    active_ring.build(ids);
+                    for (auto& nc : new_clients) g_shards.push_back(std::move(nc));
+                    std::set<int> ids;
+                    for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
+                    active_ring.build(std::vector<int>(ids.begin(), ids.end()));
                 }
             } else if (type == "remove_shard") {
                 int shard_id = cmd.at("shard_id").get<int>();
@@ -168,9 +213,9 @@ static void apply_pending_raft_commands() {
                 for (auto& sc : g_shards) {
                     if (sc->shard_id == shard_id) sc->active = false;
                 }
-                std::vector<int> ids;
-                for (auto& sc : g_shards) if (sc->active) ids.push_back(sc->shard_id);
-                active_ring.build(ids);
+                std::set<int> ids;
+                for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
+                active_ring.build(std::vector<int>(ids.begin(), ids.end()));
             } else {
                 std::cerr << "[Coordinator] WARNING: unknown raft command type \"" << type << "\"" << std::endl;
             }
@@ -181,34 +226,105 @@ static void apply_pending_raft_commands() {
     g_local_applied_count = st.applied_commands.size();
 }
 
-// Moves one key from source to dest. Insert-into-destination happens before
-// delete-from-source, always -- a duplicate-for-a-moment is fine (search
-// dedupes by external_id), a vector that's briefly on neither shard is not.
-// Returns false if any step failed; the key is left wherever it last
-// successfully existed (never silently dropped).
-static bool migrate_one_key(ShardClient& source, ShardClient& dest, const std::string& external_id) {
+struct QuorumResult {
+    bool ok;     // primary succeeded AND quorum met
+    int acks;    // total replicas that succeeded
+    int needed;  // quorum size (majority of the replica set)
+};
+
+// Fires the write at every replica in parallel (std::async + a local
+// futures vector, the same fan-out pattern used everywhere else in this
+// file -- discarding a std::async future immediately blocks on it, which
+// Phase 3a's heartbeat code already found the hard way). The primary's
+// specific result is tracked separately: a write only counts as
+// successful if the primary itself acked AND a majority of the full
+// replica set (primary included) acked. A majority of secondaries
+// succeeding while the primary fails is not a successful write -- the
+// primary is the authoritative copy every subsequent read and migration
+// assumes is current.
+static QuorumResult quorum_insert(const std::vector<ShardClient*>& replicas,
+                                   const std::string& external_id,
+                                   const std::vector<float>& vec,
+                                   const std::string& metadata) {
+    std::vector<std::future<bool>> futures;
+    int primary_idx = -1;
+    for (size_t i = 0; i < replicas.size(); i++) {
+        if (replicas[i]->is_primary) primary_idx = (int)i;
+        auto* sc = replicas[i];
+        futures.push_back(std::async(std::launch::async, [sc, external_id, vec, metadata]() {
+            InsertRequest req;
+            req.set_external_id(external_id);
+            for (float f : vec) req.add_vector(f);
+            req.set_metadata(metadata);
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
+            InsertResponse res;
+            grpc::Status status = sc->stub->Insert(&ctx, req, &res);
+            return status.ok() && res.ok();
+        }));
+    }
+    int acks = 0;
+    bool primary_ok = false;
+    for (size_t i = 0; i < futures.size(); i++) {
+        bool ok = futures[i].get();
+        if (ok) acks++;
+        if ((int)i == primary_idx && ok) primary_ok = true;
+    }
+    int needed = (int)(replicas.size() / 2) + 1;
+    return {primary_ok && acks >= needed, acks, needed};
+}
+
+static QuorumResult quorum_delete(const std::vector<ShardClient*>& replicas, const std::string& external_id) {
+    std::vector<std::future<bool>> futures;
+    int primary_idx = -1;
+    for (size_t i = 0; i < replicas.size(); i++) {
+        if (replicas[i]->is_primary) primary_idx = (int)i;
+        auto* sc = replicas[i];
+        futures.push_back(std::async(std::launch::async, [sc, external_id]() {
+            DeleteRequest req;
+            req.set_external_id(external_id);
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
+            DeleteResponse res;
+            grpc::Status status = sc->stub->Delete(&ctx, req, &res);
+            return status.ok() && res.ok();
+        }));
+    }
+    int acks = 0;
+    bool primary_ok = false;
+    for (size_t i = 0; i < futures.size(); i++) {
+        bool ok = futures[i].get();
+        if (ok) acks++;
+        if ((int)i == primary_idx && ok) primary_ok = true;
+    }
+    int needed = (int)(replicas.size() / 2) + 1;
+    return {primary_ok && acks >= needed, acks, needed};
+}
+
+// Moves one key from a source shard's full replica set to a destination
+// shard's full replica set. Reads from the source's primary (the one copy
+// guaranteed current), quorum-writes into the destination, then
+// quorum-deletes from the source -- insert-before-delete for the same
+// reason as every migration since Phase 2: a duplicate-for-a-moment is
+// fine, a vector visible on neither side is not. Returns false if the
+// destination quorum write failed; the source delete is best-effort
+// exactly as before.
+static bool migrate_one_key(ShardClient& source_primary,
+                             const std::vector<ShardClient*>& source_replicas,
+                             const std::vector<ShardClient*>& dest_replicas,
+                             const std::string& external_id) {
     GetVectorRequest greq;
     greq.set_external_id(external_id);
     grpc::ClientContext gctx;
     gctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(MIGRATION_RPC_TIMEOUT_MS));
     GetVectorResponse gres;
-    if (!source.stub->GetVector(&gctx, greq, &gres).ok() || !gres.ok()) return false;
+    if (!source_primary.stub->GetVector(&gctx, greq, &gres).ok() || !gres.ok()) return false;
 
-    InsertRequest ireq;
-    ireq.set_external_id(external_id);
-    for (float f : gres.vector()) ireq.add_vector(f);
-    ireq.set_metadata(gres.metadata());
-    grpc::ClientContext ictx;
-    ictx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(MIGRATION_RPC_TIMEOUT_MS));
-    InsertResponse ires;
-    if (!dest.stub->Insert(&ictx, ireq, &ires).ok() || !ires.ok()) return false;
+    std::vector<float> vec(gres.vector().begin(), gres.vector().end());
+    auto insert_result = quorum_insert(dest_replicas, external_id, vec, gres.metadata());
+    if (!insert_result.ok) return false;
 
-    DeleteRequest dreq;
-    dreq.set_external_id(external_id);
-    grpc::ClientContext dctx;
-    dctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(MIGRATION_RPC_TIMEOUT_MS));
-    DeleteResponse dres;
-    source.stub->Delete(&dctx, dreq, &dres); // best-effort: if this fails the key is duplicated, not lost
+    quorum_delete(source_replicas, external_id); // best-effort
     return true;
 }
 
@@ -227,13 +343,14 @@ int main() {
         return 1;
     }
 
-    std::vector<int> ids;
+    std::set<int> ids;
     for (const auto& ep : endpoints) {
-        g_shards.push_back(make_shard_client(ep.shard_id, ep.host, ep.port));
-        ids.push_back(ep.shard_id);
+        g_shards.push_back(make_shard_client(ep.shard_id, ep.replica_id, ep.host, ep.port, ep.is_primary));
+        ids.insert(ep.shard_id);
     }
-    active_ring.build(ids);
-    std::cout << "[Coordinator] Loaded " << g_shards.size() << " shard(s) from " << g_cluster_config_path << std::endl;
+    active_ring.build(std::vector<int>(ids.begin(), ids.end()));
+    std::cout << "[Coordinator] Loaded " << g_shards.size() << " replica(s) across "
+              << ids.size() << " shard(s) from " << g_cluster_config_path << std::endl;
 
     std::unique_ptr<nanodb::raft::RaftServiceImpl> raft_service;
     std::unique_ptr<grpc::Server> raft_server;
@@ -321,32 +438,29 @@ int main() {
 
             HashRing ring = ring_snapshot();
             auto pool = live_shards();
-            ShardClient* dest = find_shard(pool, ring.route(external_id));
-            if (!dest) {
+            int shard_id = ring.route(external_id);
+            auto replicas = replicas_for_shard(pool, shard_id);
+            if (replicas.empty()) {
                 res.status = 503;
                 res.set_content(R"({"error":"destination shard unavailable"})", "application/json");
                 return;
             }
 
-            InsertRequest grpc_req;
-            grpc_req.set_external_id(external_id);
-            for (const auto& v : body["vector"]) grpc_req.add_vector(v.get<float>());
-            grpc_req.set_metadata(body.value("metadata", ""));
+            std::vector<float> vec;
+            for (const auto& v : body["vector"]) vec.push_back(v.get<float>());
+            std::string metadata = body.value("metadata", "");
 
-            grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
-            InsertResponse grpc_res;
-            grpc::Status status = dest->stub->Insert(&ctx, grpc_req, &grpc_res);
-
-            if (!status.ok() || !grpc_res.ok()) {
+            auto result = quorum_insert(replicas, external_id, vec, metadata);
+            if (!result.ok) {
                 res.status = 502;
-                json err = {{"error", "shard " + std::to_string(dest->shard_id) + " insert failed: " +
-                                       (status.ok() ? grpc_res.error() : status.error_message())}};
+                json err = {{"error", "write quorum not met"}, {"shard", shard_id},
+                            {"acks", result.acks}, {"needed", result.needed}};
                 res.set_content(err.dump(), "application/json");
                 return;
             }
             res.status = 201;
-            json ok = {{"status", "ok"}, {"id", external_id}, {"shard", dest->shard_id}};
+            json ok = {{"status", "ok"}, {"id", external_id}, {"shard", shard_id},
+                       {"acks", result.acks}, {"needed", result.needed}};
             res.set_content(ok.dump(), "application/json");
         } catch (const json::exception& e) {
             res.status = 400;
@@ -365,8 +479,9 @@ int main() {
             int k = body["k"].get<int>();
             std::vector<float> vec;
             for (const auto& v : body["vector"]) vec.push_back(v.get<float>());
+            std::string consistency = body.value("consistency", "eventual");
 
-            auto pool = live_shards();
+            auto pool = select_read_targets(live_shards(), consistency);
             std::vector<std::future<std::pair<int, SearchResponse>>> futures;
             for (auto* sc : pool) {
                 futures.push_back(std::async(std::launch::async, [sc, vec, k]() {
@@ -409,7 +524,7 @@ int main() {
                 if (deduped.size() >= (size_t)k) break;
             }
 
-            json response = {{"results", deduped}};
+            json response = {{"results", deduped}, {"consistency", consistency}};
             if (!unavailable.empty()) {
                 response["degraded"] = true;
                 response["unavailable_shards"] = unavailable;
@@ -430,45 +545,52 @@ int main() {
         std::string external_id = req.matches[1];
         HashRing ring = ring_snapshot();
         auto pool = live_shards();
-        ShardClient* dest = find_shard(pool, ring.route(external_id));
-        if (!dest) {
+        int shard_id = ring.route(external_id);
+        auto replicas = replicas_for_shard(pool, shard_id);
+        if (replicas.empty()) {
             res.status = 503;
             res.set_content(R"({"error":"destination shard unavailable"})", "application/json");
             return;
         }
-        DeleteRequest grpc_req;
-        grpc_req.set_external_id(external_id);
-        grpc::ClientContext ctx;
-        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
-        DeleteResponse grpc_res;
-        grpc::Status status = dest->stub->Delete(&ctx, grpc_req, &grpc_res);
-        if (!status.ok() || !grpc_res.ok()) {
+        auto result = quorum_delete(replicas, external_id);
+        if (!result.ok) {
             res.status = 404;
-            res.set_content(R"({"error":"not found or shard unreachable"})", "application/json");
+            json err = {{"error", "not found, or delete quorum not met"}, {"acks", result.acks}, {"needed", result.needed}};
+            res.set_content(err.dump(), "application/json");
             return;
         }
-        res.set_content(R"({"status":"ok","id":")" + external_id + "\"}", "application/json");
+        json ok = {{"status", "ok"}, {"id", external_id}, {"acks", result.acks}, {"needed", result.needed}};
+        res.set_content(ok.dump(), "application/json");
     });
 
     server.Get("/stats", [&](const httplib::Request&, httplib::Response& res) {
         auto pool = live_shards();
-        json per_shard = json::array();
+        json replicas_json = json::array();
         uint64_t total = 0;
-        std::vector<int> unavailable;
+        std::vector<json> unavailable;
         for (auto* sc : pool) {
             StatsRequest grpc_req;
             grpc::ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
             StatsResponse grpc_res;
             grpc::Status status = sc->stub->Stats(&ctx, grpc_req, &grpc_res);
-            if (!status.ok()) { unavailable.push_back(sc->shard_id); continue; }
-            per_shard.push_back({{"shard_id", sc->shard_id}, {"element_count", grpc_res.element_count()}});
-            total += grpc_res.element_count();
+            if (!status.ok()) {
+                unavailable.push_back({{"shard_id", sc->shard_id}, {"replica_id", sc->replica_id}});
+                continue;
+            }
+            replicas_json.push_back({{"shard_id", sc->shard_id}, {"replica_id", sc->replica_id},
+                                      {"is_primary", sc->is_primary.load()},
+                                      {"element_count", grpc_res.element_count()}});
+            // Sum primaries only -- each shard's data is replicated across
+            // its full replica set, so summing every replica would inflate
+            // the total by roughly the replication factor instead of
+            // reporting how many actual unique vectors exist.
+            if (sc->is_primary) total += grpc_res.element_count();
         }
-        json response = {{"total_element_count", total}, {"shards", per_shard}, {"num_shards", pool.size()}};
+        json response = {{"total_element_count", total}, {"replicas", replicas_json}};
         if (!unavailable.empty()) {
             response["degraded"] = true;
-            response["unavailable_shards"] = unavailable;
+            response["unavailable_replicas"] = unavailable;
         }
         res.set_content(response.dump(), "application/json");
     });
@@ -499,7 +621,9 @@ int main() {
         res.set_content(response.dump(), "application/json");
     });
 
-    // POST /admin/shards/add  body: {"shard_id": 3, "host": "shard-3", "port": 9090}
+    // POST /admin/shards/add  body: {"shard_id": 3, "replicas": [
+    //   {"replica_id": 0, "host": "shard-3a", "port": 9090, "primary": true},
+    //   {"replica_id": 1, "host": "shard-3b", "port": 9090, "primary": false}]}
     server.Post("/admin/shards/add", [&](const httplib::Request& req, httplib::Response& res) {
         if (!g_raft_node) {
             res.status = 400;
@@ -523,13 +647,25 @@ int main() {
         try {
             auto body = json::parse(req.body);
             int new_id = body.at("shard_id").get<int>();
-            std::string host = body.at("host").get<std::string>();
-            int port = body.at("port").get<int>();
+            if (!body.contains("replicas") || body.at("replicas").empty()) {
+                rebalancing = false;
+                res.status = 400;
+                res.set_content(R"({"error":"replicas must be a non-empty array"})", "application/json");
+                return;
+            }
+            bool has_primary = false;
+            for (const auto& r : body.at("replicas")) if (r.value("primary", false)) has_primary = true;
+            if (!has_primary) {
+                rebalancing = false;
+                res.status = 400;
+                res.set_content(R"({"error":"exactly one replica must be marked primary"})", "application/json");
+                return;
+            }
 
-            // Propose first: a shard can't be migrated TO until it has a
-            // ShardClient/stub, which only exists once the AddShard command
-            // has actually been applied.
-            json cmd = {{"type", "add_shard"}, {"shard_id", new_id}, {"host", host}, {"port", port}};
+            // Propose first: a shard can't be migrated TO until it has
+            // ShardClients/stubs, which only exist once the AddShard
+            // command has actually been applied.
+            json cmd = {{"type", "add_shard"}, {"shard_id", new_id}, {"replicas", body.at("replicas")}};
             if (!g_raft_node->propose(cmd.dump())) {
                 rebalancing = false;
                 res.status = 503;
@@ -539,8 +675,8 @@ int main() {
             apply_pending_raft_commands(); // don't wait for the poller's cadence
 
             auto pool = live_shards();
-            ShardClient* new_ptr = find_shard(pool, new_id);
-            if (!new_ptr) {
+            auto dest_replicas = replicas_for_shard(pool, new_id);
+            if (dest_replicas.empty()) {
                 rebalancing = false;
                 res.status = 500;
                 res.set_content(R"({"error":"committed via raft but not present locally after apply -- this should not happen"})", "application/json");
@@ -548,18 +684,24 @@ int main() {
             }
             HashRing new_ring = ring_snapshot();
 
+            std::set<int> source_shard_ids;
+            for (auto* sc : pool) if (sc->shard_id != new_id) source_shard_ids.insert(sc->shard_id);
+
             int migrated = 0, failed = 0;
-            for (auto* source : pool) {
-                if (source->shard_id == new_id) continue;
+            for (int source_shard_id : source_shard_ids) {
+                auto source_replicas = replicas_for_shard(pool, source_shard_id);
+                ShardClient* source_primary = find_primary(pool, source_shard_id);
+                if (!source_primary) continue;
+
                 ListLocalIdsRequest lreq;
                 grpc::ClientContext lctx;
                 lctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
                 ListLocalIdsResponse lres;
-                if (!source->stub->ListLocalIds(&lctx, lreq, &lres).ok()) continue;
+                if (!source_primary->stub->ListLocalIds(&lctx, lreq, &lres).ok()) continue;
 
                 for (const auto& external_id : lres.external_ids()) {
                     if (new_ring.route(external_id) != new_id) continue;
-                    if (migrate_one_key(*source, *new_ptr, external_id)) migrated++;
+                    if (migrate_one_key(*source_primary, source_replicas, dest_replicas, external_id)) migrated++;
                     else failed++;
                 }
             }
@@ -603,24 +745,28 @@ int main() {
             int leaving_id = body.at("shard_id").get<int>();
 
             auto pool = live_shards();
-            ShardClient* leaving = find_shard(pool, leaving_id);
-            if (!leaving) {
+            auto leaving_replicas = replicas_for_shard(pool, leaving_id);
+            ShardClient* leaving_primary = find_primary(pool, leaving_id);
+            if (leaving_replicas.empty() || !leaving_primary) {
                 rebalancing = false;
                 res.status = 404;
                 res.set_content(R"({"error":"shard not found or already inactive"})", "application/json");
                 return;
             }
-            if (pool.size() <= 1) {
+
+            std::set<int> all_shard_ids;
+            for (auto* sc : pool) all_shard_ids.insert(sc->shard_id);
+            if (all_shard_ids.size() <= 1) {
                 rebalancing = false;
                 res.status = 400;
                 res.set_content(R"({"error":"cannot remove the last shard"})", "application/json");
                 return;
             }
 
-            // Migrate BEFORE proposing, deliberately: the leaving shard
-            // already has a live stub (it's still in g_shards), so unlike
-            // AddShard there's no technical need to commit first. Moving
-            // the data first and proposing RemoveShard as the atomic
+            // Migrate BEFORE proposing, deliberately: the leaving shard's
+            // replicas already have live stubs (they're still in g_shards),
+            // so unlike AddShard there's no technical need to commit first.
+            // Moving the data first and proposing RemoveShard as the atomic
             // "officially gone" declaration afterward means that by the
             // time ANY node -- leader or follower -- applies this command,
             // the migration is already done, so it's always safe for that
@@ -628,7 +774,7 @@ int main() {
             // from search/stats) with no window where data is invisible
             // because it's "removed" on paper but not actually moved yet.
             std::vector<int> remaining_ids;
-            for (auto* sc : pool) if (sc->shard_id != leaving_id) remaining_ids.push_back(sc->shard_id);
+            for (int sid : all_shard_ids) if (sid != leaving_id) remaining_ids.push_back(sid);
             HashRing post_remove_ring(remaining_ids);
 
             int migrated = 0, failed = 0;
@@ -636,11 +782,12 @@ int main() {
             grpc::ClientContext lctx;
             lctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
             ListLocalIdsResponse lres;
-            if (leaving->stub->ListLocalIds(&lctx, lreq, &lres).ok()) {
+            if (leaving_primary->stub->ListLocalIds(&lctx, lreq, &lres).ok()) {
                 for (const auto& external_id : lres.external_ids()) {
-                    ShardClient* dest = find_shard(pool, post_remove_ring.route(external_id));
-                    if (!dest) { failed++; continue; }
-                    if (migrate_one_key(*leaving, *dest, external_id)) migrated++;
+                    int dest_shard_id = post_remove_ring.route(external_id);
+                    auto dest_replicas = replicas_for_shard(pool, dest_shard_id);
+                    if (dest_replicas.empty()) { failed++; continue; }
+                    if (migrate_one_key(*leaving_primary, leaving_replicas, dest_replicas, external_id)) migrated++;
                     else failed++;
                 }
             }

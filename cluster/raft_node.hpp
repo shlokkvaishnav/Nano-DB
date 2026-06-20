@@ -94,6 +94,18 @@ public:
             my_term = state_.current_term();
             log_.append(my_term, command);
             my_index = log_.last_index();
+            // Without this, commit-index advancement only happens as a side
+            // effect of a peer acking AppendEntries (in
+            // send_append_entries_to_peer). For a cluster where the
+            // leader's own log already constitutes a majority -- the
+            // degenerate but valid single-node case, cluster_size=1 -- that
+            // path is never reached at all (replicate_to_followers() has no
+            // peers to iterate over), so nothing could ever commit. Safe to
+            // call unconditionally: in a multi-node cluster this is just an
+            // early check that's a no-op until real peer acks arrive, since
+            // their match_index entries won't yet reflect this brand-new
+            // entry.
+            advance_commit_index_locked();
         }
         replicate_to_followers();
 
