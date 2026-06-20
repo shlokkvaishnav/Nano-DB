@@ -47,7 +47,7 @@ public:
     // Returns the shard_id that owns external_id under the current ring.
     // Precondition: build() has been called with at least one shard id.
     int route(const std::string& external_id) const {
-        uint64_t h = fnv1a_64(external_id);
+        uint64_t h = well_mixed_hash(external_id);
         auto it = std::lower_bound(
             ring_.begin(), ring_.end(), h,
             [](const std::pair<uint64_t, int>& point, uint64_t target) {

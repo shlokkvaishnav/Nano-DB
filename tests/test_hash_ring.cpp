@@ -38,13 +38,29 @@ void test_migration_cost_bounded() {
     double pct = 100.0 * moved / n;
     // theoretical minimum is 25% (1/4); generous upper bound to avoid flakiness
     assert(pct > 15.0 && pct < 32.0);
-    std::cout << "test_migration_cost_bounded passed. (" << pct << "% moved)\n";
+    std::cout << "test_migration_cost_bounded passed. (~" << (int)pct << "% moved)\n";
+}
+
+void test_sequential_keys_balanced() {
+    HashRing ring({0, 1, 2});
+    std::map<int, int> counts;
+    int n = 200;
+    for (int i = 1; i <= n; i++) {
+        counts[ring.route("vec-" + std::to_string(i))]++;
+    }
+    double mean = n / 3.0;
+    for (auto& [shard, count] : counts) {
+        double ratio = count / mean;
+        assert(ratio > 0.5 && ratio < 1.5); // shouldn't be wildly skewed like 90/10/100
+    }
+    std::cout << "test_sequential_keys_balanced passed.\n";
 }
 
 int main() {
     test_route_deterministic();
     test_load_balance();
     test_migration_cost_bounded();
+    test_sequential_keys_balanced();
     std::cout << "All hash ring tests passed.\n";
     return 0;
 }

@@ -26,5 +26,10 @@ inline size_t route_shard(const std::string& external_id, size_t num_shards) {
     return fnv1a_64(external_id) % num_shards;
 }
 
+inline uint64_t well_mixed_hash(const std::string& external_id) {
+    uint64_t h = fnv1a_64(external_id);
+    return fnv1a_64(std::to_string(h));
+}
+
 } // namespace cluster
 } // namespace nanodb
