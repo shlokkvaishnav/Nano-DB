@@ -14,7 +14,8 @@ RUN if [ ! -d "extern/httplib/.git" ] && [ ! -f "extern/httplib/CMakeLists.txt" 
 RUN mkdir build && cd build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DNANODB_BUILD_PYTHON=OFF \
-             -DNANODB_BUILD_SERVER=ON && \
+             -DNANODB_BUILD_SERVER=ON \
+             -DNANODB_BUILD_CLUSTER=OFF && \
     cmake --build . --target nano_server -j$(nproc)
 
 # Stage 2: Runtime
