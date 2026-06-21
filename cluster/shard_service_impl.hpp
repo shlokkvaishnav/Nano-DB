@@ -20,6 +20,10 @@ public:
                                  std::to_string(config::VECTOR_DIM));
             return grpc::Status::OK;
         }
+        if (!check_and_advance_epoch(request->epoch(), response->mutable_error())) {
+            response->set_ok(false);
+            return grpc::Status::OK;
+        }
         std::vector<float> vec(request->vector().begin(), request->vector().end());
         auto [local_id, is_new] = id_map_.assign(request->external_id());
         (void)is_new;
@@ -50,6 +54,10 @@ public:
 
     grpc::Status Delete(grpc::ServerContext*, const DeleteRequest* request,
                          DeleteResponse* response) override {
+        if (!check_and_advance_epoch(request->epoch(), response->mutable_error())) {
+            response->set_ok(false);
+            return grpc::Status::OK;
+        }
         uint32_t local_id;
         if (!id_map_.lookup(request->external_id(), local_id)) {
             response->set_ok(false);
@@ -122,6 +130,35 @@ private:
     HNSW& index_;
     IdMapStore& id_map_;
     std::string shard_id_;
+    // The fencing token: the highest epoch this shard has seen in any
+    // accepted write. An epoch is just the Raft log index of the
+    // SetPrimary (or initial AddShard) command that most recently
+    // declared cluster topology for this shard -- already monotonically
+    // increasing, no new machinery needed to generate it. Persistence
+    // across a shard node restart is a known, accepted gap for this
+    // phase (see Phase 4b plan, Section 1): the scenario it would matter
+    // for -- this exact process crashing and restarting in the narrow
+    // window between being demoted and a stale coordinator's next write
+    // arriving -- is far narrower than the actual problem this fixes
+    // (an old primary that's still running, not one that crashed).
+    std::atomic<uint64_t> current_epoch_{0};
+
+    // Returns false (and sets error_out) if request_epoch is behind what
+    // this shard has already seen -- the request came from a coordinator
+    // with a stale view of who's allowed to write here. Returns true and
+    // advances the high-water mark otherwise, including the normal case
+    // where request_epoch equals the current value (most writes, between
+    // primary changes, are all at the same epoch).
+    bool check_and_advance_epoch(uint64_t request_epoch, std::string* error_out) {
+        uint64_t current = current_epoch_.load();
+        if (request_epoch < current) {
+            *error_out = "stale epoch " + std::to_string(request_epoch) +
+                         ", this shard has already seen epoch " + std::to_string(current);
+            return false;
+        }
+        if (request_epoch > current) current_epoch_.store(request_epoch);
+        return true;
+    }
 };
 
 } // namespace cluster

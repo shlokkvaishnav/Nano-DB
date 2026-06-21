@@ -33,12 +33,14 @@ static constexpr int RPC_TIMEOUT_MS = 800;
 static constexpr int MIGRATION_RPC_TIMEOUT_MS = 2000;
 
 static std::atomic<bool> g_apply_poller_running{false};
+static std::atomic<bool> g_health_check_running{false};
 
 void signal_handler(int) {
     if (g_server) g_server->stop();
     if (g_raft_node) g_raft_node->stop();
     if (g_raft_server) g_raft_server->Shutdown();
     g_apply_poller_running = false;
+    g_health_check_running = false;
 }
 
 struct ShardClient {
@@ -50,6 +52,7 @@ struct ShardClient {
     std::unique_ptr<ShardService::Stub> stub;
     std::atomic<bool> active{true};
     std::atomic<bool> is_primary{false};
+    std::atomic<uint64_t> epoch{0};
 };
 
 // All cluster membership state lives behind this lock. Readers (the normal
@@ -73,6 +76,18 @@ static std::string g_cluster_config_path;
 // commands have already been reflected in g_shards/active_ring.
 static std::mutex g_apply_mutex;
 static uint64_t g_local_applied_count = 0;
+
+// Health-check state for primary failover. Only the current Raft leader
+// acts on failures it observes (see health_check_loop) -- followers run
+// the same loop (cheap, just pings) but never propose anything, since two
+// coordinators independently deciding "the primary is down, promote X"
+// at the same time is exactly the kind of uncoordinated action Raft
+// exists to prevent.
+static std::mutex g_health_mutex;
+static std::map<int, int> g_consecutive_primary_failures;
+static constexpr int HEALTH_CHECK_INTERVAL_MS = 1000;
+static constexpr int HEALTH_CHECK_TIMEOUT_MS = 500;
+static constexpr int FAILURES_BEFORE_FAILOVER = 3;
 
 static std::unique_ptr<ShardClient> make_shard_client(int shard_id, int replica_id, const std::string& host, int port, bool is_primary) {
     auto sc = std::make_unique<ShardClient>();
@@ -122,9 +137,7 @@ static ShardClient* find_primary(const std::vector<ShardClient*>& pool, int shar
 // One representative replica per distinct shard_id, for reads. "strong"
 // always picks the primary -- if the primary isn't currently active, that
 // shard is reported unavailable rather than silently reading a replica,
-// since the primary is the only replica reads can be sure isn't stale at
-// the moment writes stop going through it (see Phase 4b's epoch fencing
-// for the runtime-primary-change case this doesn't yet have to handle).
+// since the primary is the only replica reads can be sure isn't stale.
 // "eventual" prefers a non-primary replica when one's available, both to
 // demonstrate genuine load distribution away from the primary and because
 // there's no consistency reason to prefer it once staleness is accepted.
@@ -158,20 +171,14 @@ static void persist_cluster_state() {
     }
 }
 
-// The Phase 4a state machine: applies any newly Raft-committed
-// AddShard/RemoveShard commands to g_shards/active_ring. Safe to call from
-// any node regardless of role (followers need this too, to keep their own
-// view in sync) and safe to call redundantly (no-ops if nothing new).
-// Called both by a dedicated background poller (so followers stay in sync
-// passively) and synchronously by the leader's admin handlers right after
-// their own propose() commits, so migration logic never has to wait for
-// the poller's cadence to see the change it just made.
-//
-// add_shard now carries a full list of replicas (one shard_id -> N
-// physical nodes, one marked primary), not a single endpoint -- this is
-// the data-model shift Phase 4 makes. remove_shard is unchanged from 3c:
-// the leader only proposes it after migration has already completed, so
-// applying it is always safe to do immediately on any node.
+// The Phase 4a state machine, now also handling Phase 4b's set_primary.
+// Applies any newly Raft-committed AddShard/RemoveShard/SetPrimary
+// commands to g_shards/active_ring. Safe to call from any node regardless
+// of role (followers need this too, to keep their own view in sync) and
+// safe to call redundantly (no-ops if nothing new). Called both by a
+// dedicated background poller (so followers stay in sync passively) and
+// synchronously by handlers doing a catch-up right after their own
+// propose() commits.
 static void apply_pending_raft_commands() {
     if (!g_raft_node) return;
     std::lock_guard<std::mutex> apply_lock(g_apply_mutex);
@@ -179,6 +186,15 @@ static void apply_pending_raft_commands() {
     if (st.applied_commands.size() <= g_local_applied_count) return;
 
     for (uint64_t i = g_local_applied_count; i < st.applied_commands.size(); i++) {
+        // The epoch for any command that establishes a shard's primary --
+        // both the initial AddShard and any later SetPrimary -- is just
+        // this command's own position in the committed log (1-based, since
+        // applied_commands_[i] in RaftNode corresponds exactly to Raft log
+        // index i+1). Free, monotonically increasing, no new Raft
+        // machinery needed: it's already guaranteed to only go up, and
+        // every node applies commands in this same order, so every node
+        // computes the same epoch for the same command.
+        uint64_t command_epoch = i + 1;
         try {
             json cmd = json::parse(st.applied_commands[i]);
             std::string type = cmd.at("type").get<std::string>();
@@ -194,12 +210,14 @@ static void apply_pending_raft_commands() {
                 if (!exists) {
                     std::vector<std::unique_ptr<ShardClient>> new_clients;
                     for (const auto& r : cmd.at("replicas")) {
-                        new_clients.push_back(make_shard_client(
+                        auto sc = make_shard_client(
                             shard_id,
                             r.at("replica_id").get<int>(),
                             r.at("host").get<std::string>(),
                             r.at("port").get<int>(),
-                            r.value("primary", false)));
+                            r.value("primary", false));
+                        sc->epoch = command_epoch;
+                        new_clients.push_back(std::move(sc));
                     }
                     std::unique_lock lock(cluster_mutex);
                     for (auto& nc : new_clients) g_shards.push_back(std::move(nc));
@@ -216,6 +234,15 @@ static void apply_pending_raft_commands() {
                 std::set<int> ids;
                 for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
                 active_ring.build(std::vector<int>(ids.begin(), ids.end()));
+            } else if (type == "set_primary") {
+                int shard_id = cmd.at("shard_id").get<int>();
+                int new_primary_replica_id = cmd.at("replica_id").get<int>();
+                std::shared_lock lock(cluster_mutex);
+                for (auto& sc : g_shards) {
+                    if (sc->shard_id != shard_id) continue;
+                    sc->is_primary = (sc->replica_id == new_primary_replica_id);
+                    sc->epoch = command_epoch;
+                }
             } else {
                 std::cerr << "[Coordinator] WARNING: unknown raft command type \"" << type << "\"" << std::endl;
             }
@@ -233,15 +260,17 @@ struct QuorumResult {
 };
 
 // Fires the write at every replica in parallel (std::async + a local
-// futures vector, the same fan-out pattern used everywhere else in this
-// file -- discarding a std::async future immediately blocks on it, which
-// Phase 3a's heartbeat code already found the hard way). The primary's
-// specific result is tracked separately: a write only counts as
-// successful if the primary itself acked AND a majority of the full
-// replica set (primary included) acked. A majority of secondaries
-// succeeding while the primary fails is not a successful write -- the
-// primary is the authoritative copy every subsequent read and migration
-// assumes is current.
+// futures vector -- discarding a std::async future immediately blocks on
+// it, which Phase 3a's heartbeat code already found the hard way). Each
+// replica gets its own currently-known epoch attached (Phase 4b) -- not a
+// single shared value, since reading sc->epoch per-replica is what lets
+// a stale coordinator's writes get correctly fenced at whichever replica
+// actually receives them. The primary's specific result is tracked
+// separately: a write only counts as successful if the primary itself
+// acked AND a majority of the full replica set acked. A majority of
+// secondaries succeeding while the primary fails is not a successful
+// write -- see Phase 4b plan, Section 1 for what that means in practice
+// during an active failover.
 static QuorumResult quorum_insert(const std::vector<ShardClient*>& replicas,
                                    const std::string& external_id,
                                    const std::vector<float>& vec,
@@ -251,11 +280,13 @@ static QuorumResult quorum_insert(const std::vector<ShardClient*>& replicas,
     for (size_t i = 0; i < replicas.size(); i++) {
         if (replicas[i]->is_primary) primary_idx = (int)i;
         auto* sc = replicas[i];
-        futures.push_back(std::async(std::launch::async, [sc, external_id, vec, metadata]() {
+        uint64_t epoch = sc->epoch.load();
+        futures.push_back(std::async(std::launch::async, [sc, external_id, vec, metadata, epoch]() {
             InsertRequest req;
             req.set_external_id(external_id);
             for (float f : vec) req.add_vector(f);
             req.set_metadata(metadata);
+            req.set_epoch(epoch);
             grpc::ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
             InsertResponse res;
@@ -280,9 +311,11 @@ static QuorumResult quorum_delete(const std::vector<ShardClient*>& replicas, con
     for (size_t i = 0; i < replicas.size(); i++) {
         if (replicas[i]->is_primary) primary_idx = (int)i;
         auto* sc = replicas[i];
-        futures.push_back(std::async(std::launch::async, [sc, external_id]() {
+        uint64_t epoch = sc->epoch.load();
+        futures.push_back(std::async(std::launch::async, [sc, external_id, epoch]() {
             DeleteRequest req;
             req.set_external_id(external_id);
+            req.set_epoch(epoch);
             grpc::ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
             DeleteResponse res;
@@ -326,6 +359,81 @@ static bool migrate_one_key(ShardClient& source_primary,
 
     quorum_delete(source_replicas, external_id); // best-effort
     return true;
+}
+
+// Runs on every coordinator, leader and followers alike (cheap: it's just
+// Ping RPCs), but only the leader acts on what it sees. Requires
+// FAILURES_BEFORE_FAILOVER consecutive misses before declaring a primary
+// down, to avoid triggering a failover on one slow response. Promotion
+// doesn't move any data -- the data's already on every replica via
+// quorum-write replication -- it's purely a Raft-committed declaration of
+// who's authoritative now, which is why this can be as simple as one
+// propose() call with no migration logic attached.
+static void health_check_loop() {
+    while (g_health_check_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(HEALTH_CHECK_INTERVAL_MS));
+        if (!g_raft_node) continue;
+        if (g_raft_node->status().role != "leader") continue;
+
+        auto pool = live_shards();
+        std::set<int> shard_ids;
+        for (auto* sc : pool) shard_ids.insert(sc->shard_id);
+
+        for (int shard_id : shard_ids) {
+            ShardClient* primary = find_primary(pool, shard_id);
+            if (!primary) continue;
+
+            PingRequest preq;
+            grpc::ClientContext pctx;
+            pctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(HEALTH_CHECK_TIMEOUT_MS));
+            PingResponse pres;
+            bool ok = primary->stub->Ping(&pctx, preq, &pres).ok() && pres.ok();
+
+            int failures = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_health_mutex);
+                if (ok) {
+                    g_consecutive_primary_failures[shard_id] = 0;
+                    continue;
+                }
+                failures = ++g_consecutive_primary_failures[shard_id];
+            }
+            if (failures < FAILURES_BEFORE_FAILOVER) continue;
+
+            ShardClient* candidate = nullptr;
+            for (auto* r : replicas_for_shard(pool, shard_id)) {
+                if (r == primary) continue;
+                PingRequest preq2;
+                grpc::ClientContext pctx2;
+                pctx2.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(HEALTH_CHECK_TIMEOUT_MS));
+                PingResponse pres2;
+                if (r->stub->Ping(&pctx2, preq2, &pres2).ok() && pres2.ok()) { candidate = r; break; }
+            }
+            if (!candidate) {
+                std::cerr << "[Coordinator] WARNING: shard " << shard_id
+                          << " primary unreachable, no healthy replica available to promote" << std::endl;
+                continue;
+            }
+
+            int new_primary_replica_id = candidate->replica_id;
+            {
+                std::lock_guard<std::mutex> lock(g_health_mutex);
+                g_consecutive_primary_failures[shard_id] = 0; // don't re-trigger while this is in flight
+            }
+            std::thread([shard_id, new_primary_replica_id]() {
+                json cmd = {{"type", "set_primary"}, {"shard_id", shard_id}, {"replica_id", new_primary_replica_id}};
+                if (g_raft_node->propose(cmd.dump())) {
+                    apply_pending_raft_commands();
+                    persist_cluster_state();
+                    std::cout << "[Coordinator] Failover: shard " << shard_id
+                              << " primary -> replica " << new_primary_replica_id << std::endl;
+                } else {
+                    std::cerr << "[Coordinator] WARNING: failover proposal for shard "
+                              << shard_id << " did not commit" << std::endl;
+                }
+            }).detach();
+        }
+    }
 }
 
 int main() {
@@ -404,6 +512,7 @@ int main() {
     }
 
     std::thread apply_poller_thread;
+    std::thread health_check_thread;
     if (g_raft_node) {
         g_apply_poller_running = true;
         apply_poller_thread = std::thread([&]() {
@@ -412,6 +521,8 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
+        g_health_check_running = true;
+        health_check_thread = std::thread(health_check_loop);
     }
 
     httplib::Server server;
@@ -579,7 +690,7 @@ int main() {
                 continue;
             }
             replicas_json.push_back({{"shard_id", sc->shard_id}, {"replica_id", sc->replica_id},
-                                      {"is_primary", sc->is_primary.load()},
+                                      {"is_primary", sc->is_primary.load()}, {"epoch", sc->epoch.load()},
                                       {"element_count", grpc_res.element_count()}});
             // Sum primaries only -- each shard's data is replicated across
             // its full replica set, so summing every replica would inflate
@@ -813,10 +924,61 @@ int main() {
         }
     });
 
+    // POST /admin/shards/set_primary  body: {"shard_id": 1, "replica_id": 2}
+    // Manual failover / primary promotion. The automatic health check uses
+    // exactly this same mechanism internally.
+    server.Post("/admin/shards/set_primary", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!g_raft_node) {
+            res.status = 400;
+            res.set_content(R"({"error":"raft is not enabled on this coordinator"})", "application/json");
+            return;
+        }
+        auto raft_st = g_raft_node->status();
+        if (raft_st.role != "leader") {
+            res.status = 503;
+            json err = {{"error", "not the leader"}, {"leader_id", raft_st.leader_id}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        try {
+            auto body = json::parse(req.body);
+            int shard_id = body.at("shard_id").get<int>();
+            int replica_id = body.at("replica_id").get<int>();
+
+            auto pool = live_shards();
+            bool valid_replica = false;
+            for (auto* sc : replicas_for_shard(pool, shard_id)) {
+                if (sc->replica_id == replica_id) valid_replica = true;
+            }
+            if (!valid_replica) {
+                res.status = 404;
+                res.set_content(R"({"error":"shard or replica not found"})", "application/json");
+                return;
+            }
+
+            json cmd = {{"type", "set_primary"}, {"shard_id", shard_id}, {"replica_id", replica_id}};
+            if (!g_raft_node->propose(cmd.dump())) {
+                res.status = 503;
+                res.set_content(R"({"error":"raft proposal did not commit, lost leadership or timed out"})", "application/json");
+                return;
+            }
+            apply_pending_raft_commands();
+            persist_cluster_state();
+            json ok = {{"status", "ok"}, {"shard_id", shard_id}, {"new_primary_replica_id", replica_id}};
+            res.set_content(ok.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            json err = {{"error", e.what()}};
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
     std::cout << "[Coordinator] Listening on 0.0.0.0:" << http_port << std::endl;
     server.listen("0.0.0.0", http_port);
     if (raft_server_thread.joinable()) raft_server_thread.join();
     if (apply_poller_thread.joinable()) apply_poller_thread.join();
+    if (health_check_thread.joinable()) health_check_thread.join();
     std::cout << "[Coordinator] Stopped." << std::endl;
     return 0;
 }
