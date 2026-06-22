@@ -33,10 +33,8 @@ struct RaftPeer {
 // This is the single trickiest correctness rule in Raft (paper section
 // 5.4.2, "Figure 8"): a leader may only directly commit an entry from its
 // OWN current term, never an entry from an earlier term, even if that
-// earlier entry is already on a majority of logs. Committing it happens
-// only indirectly, as a side effect of a later current-term entry being
-// committed. Returns current_commit_index unchanged if nothing new should
-// commit yet.
+// earlier entry is already on a majority of logs. Returns current_commit_index
+// unchanged if nothing new should commit yet.
 inline uint64_t compute_new_commit_index(uint64_t leader_last_index,
                                           const std::map<int, uint64_t>& match_index,
                                           size_t cluster_size,
@@ -63,6 +61,10 @@ public:
         : node_id_(node_id), peers_(std::move(peers)) {
         state_.open_file(state_path);
         log_.open_file(log_path);
+        // Initialise last_applied_ from the snapshot so apply_committed_entries_locked
+        // doesn't try to replay entries already captured by the snapshot.
+        last_applied_ = log_.snapshot_last_index();
+        commit_index_ = log_.snapshot_last_index();
         for (auto& p : peers_) {
             if (p.node_id == node_id_) continue;
             auto channel = grpc::CreateChannel(p.address(), grpc::InsecureChannelCredentials());
@@ -80,12 +82,6 @@ public:
         if (ticker_thread_.joinable()) ticker_thread_.join();
     }
 
-    // Returns true if the command was replicated to a majority and
-    // committed within timeout_ms. False if this node isn't the leader,
-    // it stepped down while the entry was in flight, or the timeout
-    // expired. The caller should NOT assume false means the command was
-    // not applied anywhere -- it may still commit later via a new leader
-    // if it was already replicated to a majority before a step-down.
     bool propose(const std::string& command, int timeout_ms = 2000) {
         uint64_t my_index, my_term;
         {
@@ -94,17 +90,6 @@ public:
             my_term = state_.current_term();
             log_.append(my_term, command);
             my_index = log_.last_index();
-            // Without this, commit-index advancement only happens as a side
-            // effect of a peer acking AppendEntries (in
-            // send_append_entries_to_peer). For a cluster where the
-            // leader's own log already constitutes a majority -- the
-            // degenerate but valid single-node case, cluster_size=1 -- that
-            // path is never reached at all (replicate_to_followers() has no
-            // peers to iterate over), so nothing could ever commit. Safe to
-            // call unconditionally: in a multi-node cluster this is just an
-            // early check that's a no-op until real peer acks arrive, since
-            // their match_index entries won't yet reflect this brand-new
-            // entry.
             advance_commit_index_locked();
         }
         replicate_to_followers();
@@ -151,10 +136,17 @@ public:
         reset_election_deadline_locked();
 
         if (req->prev_log_index() > 0) {
-            if (!log_.has_entry_at(req->prev_log_index()) ||
-                log_.term_at(req->prev_log_index()) != req->prev_log_term()) {
-                resp->set_success(false);
-                return grpc::Status::OK;
+            // If prev_log_index is covered by our snapshot it's already
+            // committed and applied -- no term check needed (and impossible:
+            // the entries are gone). Accept the AppendEntries; truncate_and_append
+            // below will skip any new entries that are also within the snapshot.
+            if (req->prev_log_index() > log_.snapshot_last_index()) {
+                // Normal path: prev must be a real entry we can verify.
+                if (!log_.has_real_entry_at(req->prev_log_index()) ||
+                    log_.term_at(req->prev_log_index()) != req->prev_log_term()) {
+                    resp->set_success(false);
+                    return grpc::Status::OK;
+                }
             }
         }
 
@@ -172,15 +164,84 @@ public:
         return grpc::Status::OK;
     }
 
+    // Install a snapshot received from the leader (InstallSnapshot RPC).
+    grpc::Status handle_install_snapshot(const InstallSnapshotRequest* req,
+                                          InstallSnapshotResponse* resp) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (req->term() > state_.current_term()) become_follower_locked(req->term());
+        resp->set_term(state_.current_term());
+        if (req->term() < state_.current_term()) return grpc::Status::OK;
+
+        role_ = Role::Follower;
+        leader_id_ = req->leader_id();
+        reset_election_deadline_locked();
+
+        if (req->last_included_index() <= log_.snapshot_last_index()) {
+            // Already have this snapshot or a newer one.
+            return grpc::Status::OK;
+        }
+
+        // Trim applied_commands_: remove all entries that fall within the
+        // incoming snapshot's coverage. Entries within the snapshot
+        // correspond to applied_commands_[0..trim_count-1] (those are the
+        // commands from absolute indices [old_snap+1 .. last_included_index]).
+        uint64_t old_snap  = log_.snapshot_last_index();
+        uint64_t new_snap  = req->last_included_index();
+        uint64_t trim_count = (new_snap > old_snap) ? (new_snap - old_snap) : 0;
+        if (trim_count > applied_commands_.size()) trim_count = applied_commands_.size();
+        applied_commands_.erase(applied_commands_.begin(),
+                                applied_commands_.begin() + static_cast<ptrdiff_t>(trim_count));
+
+        // Update volatile state.
+        if (new_snap > last_applied_) last_applied_ = new_snap;
+        if (new_snap > commit_index_) commit_index_ = new_snap;
+
+        // Compact the log: discard all real entries through new_snap.
+        log_.compact(new_snap, req->last_included_term(), req->data());
+        return grpc::Status::OK;
+    }
+
+    // Compact the log up to up_to_index. Called by the coordinator after it has
+    // applied commands through that point and serialised the state machine into
+    // snapshot_data. Returns false if up_to_index is out of range or already
+    // compacted.
+    bool compact(uint64_t up_to_index, const std::string& snapshot_data) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (up_to_index <= log_.snapshot_last_index()) return false;
+        if (up_to_index > last_applied_)               return false;
+
+        uint64_t old_snap   = log_.snapshot_last_index();
+        uint64_t trim_count = up_to_index - old_snap;
+        if (trim_count > applied_commands_.size()) return false;
+
+        applied_commands_.erase(applied_commands_.begin(),
+                                applied_commands_.begin() + static_cast<ptrdiff_t>(trim_count));
+        log_.compact(up_to_index, log_.term_at(up_to_index), snapshot_data);
+        return true;
+    }
+
     struct Status {
-        int node_id; std::string role; uint64_t term; int leader_id;
-        uint64_t log_length; uint64_t commit_index;
+        int node_id;
+        std::string role;
+        uint64_t term;
+        int leader_id;
+        uint64_t log_length;
+        uint64_t commit_index;
+        // Only entries AFTER snapshot_last_index. Position i (0-based)
+        // corresponds to absolute log index snapshot_last_index + i + 1.
         std::vector<std::string> applied_commands;
+        // Snapshot metadata (0 / "" if no snapshot yet).
+        uint64_t snapshot_last_index;
+        std::string snapshot_data;
     };
     Status status() {
         std::lock_guard<std::mutex> lock(mutex_);
-        const char* r = role_ == Role::Leader ? "leader" : role_ == Role::Candidate ? "candidate" : "follower";
-        return {node_id_, r, state_.current_term(), leader_id_, log_.last_index(), commit_index_, applied_commands_};
+        const char* r = role_ == Role::Leader ? "leader"
+                      : role_ == Role::Candidate ? "candidate" : "follower";
+        return {node_id_, r, state_.current_term(), leader_id_,
+                log_.last_index(), commit_index_,
+                applied_commands_,
+                log_.snapshot_last_index(), log_.snapshot_data()};
     }
 
 private:
@@ -195,9 +256,12 @@ private:
     int leader_id_ = -1;
     uint64_t commit_index_ = 0;
     uint64_t last_applied_ = 0;
-    std::vector<std::string> applied_commands_; // the Phase 3b state machine: an ordered record
-                                                 // of committed commands. Phase 3c replaces this
-                                                 // with actually applying AddShard/RemoveShard.
+    // Committed commands AFTER the current snapshot point.
+    // applied_commands_[i] has absolute log index
+    //   log_.snapshot_last_index() + i + 1
+    // at the time each entry was appended. After compact(), the front
+    // of this vector is erased to stay aligned with the new snapshot.
+    std::vector<std::string> applied_commands_;
     std::map<int, uint64_t> next_index_;
     std::map<int, uint64_t> match_index_;
 
@@ -209,8 +273,8 @@ private:
 
     static constexpr int ELECTION_TIMEOUT_MIN_MS = 300;
     static constexpr int ELECTION_TIMEOUT_MAX_MS = 600;
-    static constexpr int HEARTBEAT_INTERVAL_MS = 50;
-    static constexpr int RPC_TIMEOUT_MS = 100;
+    static constexpr int HEARTBEAT_INTERVAL_MS   = 50;
+    static constexpr int RPC_TIMEOUT_MS          = 100;
 
     void become_follower_locked(uint64_t new_term) {
         state_.set(new_term, -1);
@@ -220,14 +284,13 @@ private:
     void apply_committed_entries_locked() {
         while (last_applied_ < commit_index_) {
             last_applied_++;
-            applied_commands_.push_back(log_.command_at(last_applied_));
+            // command_at returns "" for indices within the snapshot range;
+            // those entries are already applied and must not be re-queued.
+            std::string cmd = log_.command_at(last_applied_);
+            if (!cmd.empty()) applied_commands_.push_back(std::move(cmd));
         }
     }
 
-    // The single trickiest safety rule in Raft (paper section 5.4.2,
-    // "Figure 8"): see compute_new_commit_index above, which this calls
-    // directly so the production path and the unit-tested path are the
-    // exact same code, not a reimplementation that could drift.
     void advance_commit_index_locked() {
         uint64_t new_commit = compute_new_commit_index(
             log_.last_index(), match_index_, peers_.size(), commit_index_,
@@ -274,23 +337,25 @@ private:
             state_.set(state_.current_term() + 1, node_id_);
             role_ = Role::Candidate;
             leader_id_ = -1;
-            election_term = state_.current_term();
+            election_term  = state_.current_term();
             last_log_index = log_.last_index();
-            last_log_term = log_.last_term();
+            last_log_term  = log_.last_term();
             reset_election_deadline_locked();
         }
 
         std::vector<std::future<bool>> futures;
         for (auto& [peer_id, stub_ptr] : stubs_) {
             auto* stub = stub_ptr.get();
-            futures.push_back(std::async(std::launch::async, [this, stub, election_term, last_log_index, last_log_term]() {
+            futures.push_back(std::async(std::launch::async,
+                [this, stub, election_term, last_log_index, last_log_term]() {
                 RequestVoteRequest req;
                 req.set_term(election_term);
                 req.set_candidate_id(node_id_);
                 req.set_last_log_index(last_log_index);
                 req.set_last_log_term(last_log_term);
                 grpc::ClientContext ctx;
-                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
+                ctx.set_deadline(std::chrono::system_clock::now()
+                                 + std::chrono::milliseconds(RPC_TIMEOUT_MS));
                 RequestVoteResponse resp;
                 grpc::Status status = stub->RequestVote(&ctx, req, &resp);
                 if (!status.ok()) return false;
@@ -322,10 +387,6 @@ private:
         }
     }
 
-    // Doubles as both heartbeat and log replication -- same RPC either
-    // way, AppendEntries with possibly-empty entries. Runs on its own
-    // thread for the same reason as Phase 3a: a slow peer can't be allowed
-    // to delay the 10ms tick loop.
     void replicate_to_followers() {
         uint64_t term;
         std::map<int, uint64_t> next_index_snapshot;
@@ -340,17 +401,38 @@ private:
             for (auto& [peer_id, stub_ptr] : stubs_) {
                 auto* stub = stub_ptr.get();
                 uint64_t next_idx = next_index_snapshot.at(peer_id);
-                futures.push_back(std::async(std::launch::async, [this, stub, term, peer_id, next_idx]() {
-                    send_append_entries_to_peer(stub, term, peer_id, next_idx);
+                futures.push_back(std::async(std::launch::async,
+                    [this, stub, term, peer_id, next_idx]() {
+                        send_append_entries_to_peer(stub, term, peer_id, next_idx);
                 }));
             }
             for (auto& f : futures) f.get();
         }).detach();
     }
 
-    void send_append_entries_to_peer(RaftService::Stub* stub, uint64_t term, int peer_id, uint64_t next_idx) {
-        AppendEntriesRequest req;
+    void send_append_entries_to_peer(RaftService::Stub* stub, uint64_t term,
+                                      int peer_id, uint64_t next_idx) {
         uint64_t prev_log_index = next_idx - 1;
+
+        // If the peer needs entries we've already compacted into a snapshot,
+        // send InstallSnapshot instead of AppendEntries.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (role_ != Role::Leader || state_.current_term() != term) return;
+            if (prev_log_index < log_.snapshot_last_index()) {
+                // Capture snapshot fields while still holding the lock.
+                uint64_t    snap_idx  = log_.snapshot_last_index();
+                uint64_t    snap_term = log_.snapshot_last_term();
+                std::string snap_data = log_.snapshot_data();
+                // Release before the network call: unique_lock tracks the
+                // unlock so its destructor won't double-unlock on return.
+                lock.unlock();
+                send_install_snapshot_to_peer(stub, term, peer_id, snap_idx, snap_term, snap_data);
+                return;
+            }
+        }
+
+        AppendEntriesRequest req;
         uint64_t prev_log_term;
         size_t n_entries_sent;
         {
@@ -372,7 +454,8 @@ private:
         }
 
         grpc::ClientContext ctx;
-        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(RPC_TIMEOUT_MS));
+        ctx.set_deadline(std::chrono::system_clock::now()
+                         + std::chrono::milliseconds(RPC_TIMEOUT_MS));
         AppendEntriesResponse resp;
         grpc::Status status = stub->AppendEntries(&ctx, req, &resp);
         if (!status.ok()) return;
@@ -388,6 +471,34 @@ private:
             advance_commit_index_locked();
         } else if (next_index_[peer_id] > 1) {
             next_index_[peer_id]--;
+        }
+    }
+
+    void send_install_snapshot_to_peer(RaftService::Stub* stub, uint64_t term,
+                                        int peer_id, uint64_t snap_idx,
+                                        uint64_t snap_term, const std::string& snap_data) {
+        InstallSnapshotRequest req;
+        req.set_term(term);
+        req.set_leader_id(node_id_);
+        req.set_last_included_index(snap_idx);
+        req.set_last_included_term(snap_term);
+        req.set_data(snap_data);
+
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now()
+                         + std::chrono::milliseconds(RPC_TIMEOUT_MS * 10));
+        InstallSnapshotResponse resp;
+        grpc::Status status = stub->InstallSnapshot(&ctx, req, &resp);
+        if (!status.ok()) return;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (resp.term() > state_.current_term()) { become_follower_locked(resp.term()); return; }
+        if (role_ != Role::Leader || state_.current_term() != term) return;
+
+        // Advance the peer's tracked indices to just past the snapshot.
+        if (snap_idx > match_index_[peer_id]) {
+            match_index_[peer_id] = snap_idx;
+            next_index_[peer_id]  = snap_idx + 1;
         }
     }
 };

@@ -43,3 +43,11 @@ if(NANODB_BUILD_CLUSTER)
         ${CMAKE_SOURCE_DIR}/include/third_party)
     add_test(NAME ClusterConfigRace COMMAND test_cluster_config_race)
 endif()
+
+# Test: RaftLog log compaction (Phase 7) -- proves snapshot index
+# arithmetic, persistence round-trip, and that the snapshot_last_index_
+# offset is load-bearing (mutation test with wrong-content proof).
+if(NANODB_BUILD_CLUSTER)
+    add_executable(test_raft_log_compaction test_raft_log_compaction.cpp)
+    add_test(NAME RaftLogCompaction COMMAND test_raft_log_compaction)
+endif()

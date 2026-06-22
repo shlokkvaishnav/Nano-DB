@@ -19,6 +19,11 @@ public:
         return node_.handle_append_entries(req, resp);
     }
 
+    grpc::Status InstallSnapshot(grpc::ServerContext*, const InstallSnapshotRequest* req,
+                                  InstallSnapshotResponse* resp) override {
+        return node_.handle_install_snapshot(req, resp);
+    }
+
 private:
     RaftNode& node_;
 };

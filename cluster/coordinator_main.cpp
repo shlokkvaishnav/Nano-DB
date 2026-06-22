@@ -76,6 +76,8 @@ static std::string g_cluster_config_path;
 // commands have already been reflected in g_shards/active_ring.
 static std::mutex g_apply_mutex;
 static uint64_t g_local_applied_count = 0;
+static uint64_t g_snapshot_applied_index = 0;
+static constexpr uint64_t COMPACTION_THRESHOLD = 64;
 
 // Health-check state for primary failover. Only the current Raft leader
 // acts on failures it observes (see health_check_loop) -- followers run
@@ -171,6 +173,49 @@ static void persist_cluster_state() {
     }
 }
 
+static std::string serialize_raft_snapshot() {
+    json shards_json = json::array();
+    std::shared_lock lock(cluster_mutex);
+    for (auto& sc : g_shards) {
+        if (!sc->active) continue;
+        shards_json.push_back({
+            {"shard_id",   sc->shard_id},
+            {"replica_id", sc->replica_id},
+            {"host",       sc->host},
+            {"port",       sc->port},
+            {"primary",    sc->is_primary.load()},
+            {"epoch",      sc->epoch.load()},
+        });
+    }
+    return json{{"shards", shards_json}}.dump();
+}
+
+static void apply_raft_snapshot(const std::string& snapshot_data) {
+    if (snapshot_data.empty()) return;
+    try {
+        json snap = json::parse(snapshot_data);
+        std::vector<std::unique_ptr<ShardClient>> new_clients;
+        for (const auto& r : snap.at("shards")) {
+            auto sc = make_shard_client(
+                r.at("shard_id").get<int>(),
+                r.at("replica_id").get<int>(),
+                r.at("host").get<std::string>(),
+                r.at("port").get<int>(),
+                r.value("primary", false));
+            sc->epoch = r.value("epoch", uint64_t{0});
+            new_clients.push_back(std::move(sc));
+        }
+        std::unique_lock lock(cluster_mutex);
+        for (auto& sc : g_shards) sc->active = false;
+        for (auto& nc : new_clients) g_shards.push_back(std::move(nc));
+        std::set<int> ids;
+        for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
+        active_ring.build(std::vector<int>(ids.begin(), ids.end()));
+    } catch (const std::exception& e) {
+        std::cerr << "[Coordinator] WARNING: failed to apply raft snapshot: " << e.what() << std::endl;
+    }
+}
+
 // The Phase 4a state machine, now also handling Phase 4b's set_primary.
 // Applies any newly Raft-committed AddShard/RemoveShard/SetPrimary
 // commands to g_shards/active_ring. Safe to call from any node regardless
@@ -183,18 +228,18 @@ static void apply_pending_raft_commands() {
     if (!g_raft_node) return;
     std::lock_guard<std::mutex> apply_lock(g_apply_mutex);
     auto st = g_raft_node->status();
+
+    // --- Snapshot catch-up ---
+    if (st.snapshot_last_index > g_snapshot_applied_index) {
+        apply_raft_snapshot(st.snapshot_data);
+        g_snapshot_applied_index = st.snapshot_last_index;
+        g_local_applied_count    = 0;
+    }
+
     if (st.applied_commands.size() <= g_local_applied_count) return;
 
     for (uint64_t i = g_local_applied_count; i < st.applied_commands.size(); i++) {
-        // The epoch for any command that establishes a shard's primary --
-        // both the initial AddShard and any later SetPrimary -- is just
-        // this command's own position in the committed log (1-based, since
-        // applied_commands_[i] in RaftNode corresponds exactly to Raft log
-        // index i+1). Free, monotonically increasing, no new Raft
-        // machinery needed: it's already guaranteed to only go up, and
-        // every node applies commands in this same order, so every node
-        // computes the same epoch for the same command.
-        uint64_t command_epoch = i + 1;
+        uint64_t command_epoch = st.snapshot_last_index + i + 1;
         try {
             json cmd = json::parse(st.applied_commands[i]);
             std::string type = cmd.at("type").get<std::string>();
@@ -251,6 +296,19 @@ static void apply_pending_raft_commands() {
         }
     }
     g_local_applied_count = st.applied_commands.size();
+
+    // --- Compaction trigger ---
+    // Once g_local_applied_count (post-snapshot entries fully applied by
+    // this coordinator) reaches COMPACTION_THRESHOLD, snapshot the current
+    // topology and compact the log. Guarded by g_apply_mutex (already held)
+    // so no concurrent compact() call can race this.
+    if (g_raft_node && g_local_applied_count >= COMPACTION_THRESHOLD) {
+        uint64_t compact_up_to = st.snapshot_last_index + g_local_applied_count;
+        std::string snap = serialize_raft_snapshot();
+        if (g_raft_node->compact(compact_up_to, snap)) {
+            g_local_applied_count = 0;  // applied_commands_ front was erased; reset cursor
+        }
+    }
 }
 
 struct QuorumResult {
@@ -538,6 +596,8 @@ int main() {
         std::string raft_log_path = raft_log_env ? raft_log_env : "raft_log.bin";
         g_raft_node = std::make_unique<nanodb::raft::RaftNode>(raft_node_id, raft_peers, raft_state_path, raft_log_path);
         raft_service = std::make_unique<nanodb::raft::RaftServiceImpl>(*g_raft_node);
+        
+        g_snapshot_applied_index = g_raft_node->status().snapshot_last_index;
 
         grpc::ServerBuilder raft_builder;
         raft_builder.AddListeningPort(self_peer.host + ":" + std::to_string(self_peer.port),
@@ -760,7 +820,8 @@ int main() {
         json response = {{"node_id", st.node_id}, {"role", st.role},
                           {"term", st.term}, {"leader_id", st.leader_id},
                           {"log_length", st.log_length}, {"commit_index", st.commit_index},
-                          {"applied_commands", st.applied_commands}};
+                          {"applied_commands", st.applied_commands},
+                          {"snapshot_last_index", st.snapshot_last_index}};
         res.set_content(response.dump(), "application/json");
     });
 
