@@ -1137,12 +1137,29 @@ int main() {
             int role_val = (st.role == "leader") ? 2 : (st.role == "candidate") ? 1 : 0;
             g_raft_role->set(role_val);
         }
+        
+        auto pool = live_shards();
         {
             std::shared_lock lock(cluster_mutex);
             std::set<int> ids;
             for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
             g_shards_active->set(ids.size());
         }
+
+        uint64_t total = 0;
+        for (auto* sc : pool) {
+            if (sc->is_primary) {
+                StatsRequest grpc_req;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
+                StatsResponse grpc_res;
+                if (sc->stub->Stats(&ctx, grpc_req, &grpc_res).ok()) {
+                    total += grpc_res.element_count();
+                }
+            }
+        }
+        g_vectors_total->set(total);
+
         res.set_content(g_metrics.render(), "text/plain; version=0.0.4; charset=utf-8");
     });
 

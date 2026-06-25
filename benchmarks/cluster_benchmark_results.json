@@ -1,22 +1,22 @@
 {
   "insert": {
-    "throughput_vps": 163.6,
+    "throughput_vps": 280.6,
     "success": 1000,
     "failure": 0,
-    "p50_ms": 20.89,
-    "p95_ms": 48.98,
-    "p99_ms": 71.88
+    "p50_ms": 11.78,
+    "p95_ms": 30.06,
+    "p99_ms": 43.73
   },
   "search": {
-    "p50_ms": 8.03,
-    "p95_ms": 19.9,
-    "p99_ms": 27.66,
+    "p50_ms": 5.7,
+    "p95_ms": 17.59,
+    "p99_ms": 27.21,
     "avg_results": 10
   },
   "failover": {
     "recovery_time_s": 0.51
   },
   "election": {
-    "election_time_s": 10.18
+    "election_time_s": -1
   }
 }

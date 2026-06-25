@@ -77,7 +77,7 @@
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": false}}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 0, "y": 6},
       "id": 5,
-      "options": {"legend": {"calcs": ["rate"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "title": "Insert QPS",
       "type": "timeseries",
       "targets": [{"expr": "rate(nanodb_inserts_total{status=\"success\"}[1m])", "legendFormat": "{{instance}}"}]
@@ -87,7 +87,7 @@
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": false}}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 8, "y": 6},
       "id": 6,
-      "options": {"legend": {"calcs": ["rate"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "title": "Search QPS",
       "type": "timeseries",
       "targets": [{"expr": "rate(nanodb_searches_total{status=\"success\"}[1m])", "legendFormat": "{{instance}}"}]
@@ -97,7 +97,7 @@
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": false}}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 6},
       "id": 7,
-      "options": {"legend": {"calcs": ["rate"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "title": "Delete QPS",
       "type": "timeseries",
       "targets": [{"expr": "rate(nanodb_deletes_total{status=\"success\"}[1m])", "legendFormat": "{{instance}}"}]
@@ -169,7 +169,7 @@
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": false}}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
       "id": 12,
-      "options": {"legend": {"calcs": ["rate"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "title": "Raft Commit Rate",
       "type": "timeseries",
       "targets": [{"expr": "rate(nanodb_raft_commits_total[1m])", "legendFormat": "{{instance}}"}]

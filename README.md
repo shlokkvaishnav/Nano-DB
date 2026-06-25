@@ -106,6 +106,8 @@ curl -X POST localhost:8080/search \
 
 ## Observability
 
+![Grafana Dashboard](docs/images/grafana.png)
+
 ```bash
 docker compose -f docker-compose.cluster.yml -f docker-compose.monitoring.yml up -d
 ```
