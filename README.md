@@ -17,7 +17,7 @@
 
 Every vector database hits the same wall. You start single-node — fast, simple, zero operational overhead. Then you try to scale. At a few million vectors you run out of RAM. At zero fault tolerance, one process crash means every search fails until someone restarts it. The production systems you've heard of (Pinecone, Qdrant, Weaviate, Milvus) solved this years ago: shard vectors across nodes, replicate for durability, use distributed consensus to decide who owns what. The question is whether you actually understand how any of that works.
 
-This project started as an experiment: take a single-node HNSW vector search engine built in C++ and ask, without reaching for a library or a managed datastore, what does it actually take to turn this into a distributed system with real fault tolerance? The answer turned out to be eight phases of progressively harder distributed systems engineering, two real bugs found only through chaos testing, and a system that survives random process kills while maintaining data integrity.
+This project is an attempt to find out. Starting from a single-node HNSW vector engine in C++, the goal was to build the distributed coordination layer on top — without reaching for a consensus library, a managed message queue, or a distributed key-value store. Every distributed systems primitive here is implemented from first principles: the hash ring, the Raft log, the quorum write protocol, the epoch fence. The non-trivial part isn't any one of these in isolation — it's making them compose correctly under failures, where the bugs are timing-dependent and only surface under load with random process kills.
 
 ---
 
@@ -75,16 +75,6 @@ The Raft implementation is the centrepiece of this project, built from the paper
 **The Figure 8 commit rule** — the hardest part of Raft — is implemented as a pure function (`compute_new_commit_index`) and tested with a constructed adversarial 5-node scenario plus a mutation test that proves the check is load-bearing, not incidental.
 
 **Log compaction** snapshots the cluster topology every 64 committed entries and installs snapshots on lagging followers instead of replaying full history.
-
----
-
-## Bugs found via chaos testing
-
-Two real bugs were found only through the chaos harness, not through unit tests:
-
-**Bug 1: Non-atomic config file write.** `save_cluster_config` opened the config path with `O_TRUNC`, truncating the file before writing new content. A coordinator killed mid-write left a corrupted JSON file. On restart, it read the truncated file and exited with code 1 — unrecoverable without manual intervention. Fix: write to a temp file, then `rename()` (atomic on Linux).
-
-**Bug 2: Failover promoting the wrong replica.** The health check loop originally promoted the *first reachable* non-primary replica when the primary died. If replica 1 had been down for 30 seconds and missed 40 writes, but then came back, it would be promoted over replica 2 (which had all the data) just because it was first in iteration order. 40 confirmed writes silently disappeared. Fix: query `Stats()` on every reachable candidate, promote highest `element_count`.
 
 ---
 
