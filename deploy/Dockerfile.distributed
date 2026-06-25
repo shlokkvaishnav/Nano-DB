@@ -29,5 +29,6 @@ CMD ["./nano_shard_node"]
 
 FROM runtime_base AS coordinator
 COPY --from=builder /app/build/nano_coordinator .
-EXPOSE 8080
+RUN mkdir -p raft_data
+EXPOSE 8080 7100
 CMD ["./nano_coordinator"]

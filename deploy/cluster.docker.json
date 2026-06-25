@@ -1,7 +1,10 @@
 {
   "shards": [
-    {"shard_id": 0, "host": "shard-0", "port": 9090},
-    {"shard_id": 1, "host": "shard-1", "port": 9090},
-    {"shard_id": 2, "host": "shard-2", "port": 9090}
+    {"shard_id": 0, "replica_id": 0, "host": "shard-0-replica-0", "port": 9090, "primary": true},
+    {"shard_id": 0, "replica_id": 1, "host": "shard-0-replica-1", "port": 9090, "primary": false},
+    {"shard_id": 0, "replica_id": 2, "host": "shard-0-replica-2", "port": 9090, "primary": false},
+    {"shard_id": 1, "replica_id": 0, "host": "shard-1-replica-0", "port": 9090, "primary": true},
+    {"shard_id": 1, "replica_id": 1, "host": "shard-1-replica-1", "port": 9090, "primary": false},
+    {"shard_id": 1, "replica_id": 2, "host": "shard-1-replica-2", "port": 9090, "primary": false}
   ]
 }

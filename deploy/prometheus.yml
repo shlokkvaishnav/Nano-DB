@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "nanodb-coordinators"
+    static_configs:
+      - targets:
+          - "coordinator-0:8080"
+          - "coordinator-1:8080"
+          - "coordinator-2:8080"

@@ -22,6 +22,7 @@
 #include "raft_node.hpp"
 #include "raft_config.hpp"
 #include "raft_service_impl.hpp"
+#include "metrics_registry.hpp"
 
 using json = nlohmann::json;
 using namespace nanodb::cluster;
@@ -69,6 +70,23 @@ static std::vector<std::unique_ptr<ShardClient>> g_shards;
 static HashRing active_ring;
 static std::atomic<bool> rebalancing{false};
 static std::string g_cluster_config_path;
+
+// --- Prometheus metrics ---
+static nanodb::metrics::Registry g_metrics;
+static nanodb::metrics::Counter* g_inserts_success = nullptr;
+static nanodb::metrics::Counter* g_inserts_failure = nullptr;
+static nanodb::metrics::Counter* g_searches_success = nullptr;
+static nanodb::metrics::Counter* g_searches_failure = nullptr;
+static nanodb::metrics::Counter* g_deletes_success = nullptr;
+static nanodb::metrics::Counter* g_deletes_failure = nullptr;
+static nanodb::metrics::Histogram* g_insert_duration = nullptr;
+static nanodb::metrics::Histogram* g_search_duration = nullptr;
+static nanodb::metrics::Gauge* g_vectors_total = nullptr;
+static nanodb::metrics::Gauge* g_shards_active = nullptr;
+static nanodb::metrics::Gauge* g_raft_term = nullptr;
+static nanodb::metrics::Gauge* g_raft_role = nullptr;
+static nanodb::metrics::Counter* g_raft_commits = nullptr;
+static nanodb::metrics::Counter* g_failovers_total = nullptr;
 
 // Serializes apply_pending_raft_commands() across callers (the dedicated
 // poller thread and any admin handler doing a synchronous catch-up after
@@ -237,6 +255,9 @@ static void apply_pending_raft_commands() {
     }
 
     if (st.applied_commands.size() <= g_local_applied_count) return;
+
+    uint64_t new_commands = st.applied_commands.size() - g_local_applied_count;
+    g_raft_commits->inc(new_commands);
 
     for (uint64_t i = g_local_applied_count; i < st.applied_commands.size(); i++) {
         uint64_t command_epoch = st.snapshot_last_index + i + 1;
@@ -529,6 +550,7 @@ static void health_check_loop() {
                     persist_cluster_state();
                     std::cout << "[Coordinator] Failover: shard " << shard_id
                               << " primary -> replica " << new_primary_replica_id << std::endl;
+                    g_failovers_total->inc();
                 } else {
                     std::cerr << "[Coordinator] WARNING: failover proposal for shard "
                               << shard_id << " did not commit" << std::endl;
@@ -539,6 +561,21 @@ static void health_check_loop() {
 }
 
 int main() {
+    g_inserts_success = &g_metrics.counter("nanodb_inserts_total", "Total successful insert operations", {{"status", "success"}});
+    g_inserts_failure = &g_metrics.counter("nanodb_inserts_total", "Total successful insert operations", {{"status", "failure"}});
+    g_searches_success = &g_metrics.counter("nanodb_searches_total", "Total search operations", {{"status", "success"}});
+    g_searches_failure = &g_metrics.counter("nanodb_searches_total", "Total search operations", {{"status", "failure"}});
+    g_deletes_success = &g_metrics.counter("nanodb_deletes_total", "Total successful delete operations", {{"status", "success"}});
+    g_deletes_failure = &g_metrics.counter("nanodb_deletes_total", "Total successful delete operations", {{"status", "failure"}});
+    g_insert_duration = &g_metrics.histogram("nanodb_insert_duration_seconds", "Insert operation latency in seconds");
+    g_search_duration = &g_metrics.histogram("nanodb_search_duration_seconds", "Search operation latency in seconds");
+    g_vectors_total = &g_metrics.gauge("nanodb_vectors_total", "Total vectors stored across all shards");
+    g_shards_active = &g_metrics.gauge("nanodb_shards_active", "Number of active shards");
+    g_raft_term = &g_metrics.gauge("nanodb_raft_term_current", "Current Raft term");
+    g_raft_role = &g_metrics.gauge("nanodb_raft_role", "Current Raft role (0=follower, 1=candidate, 2=leader)");
+    g_raft_commits = &g_metrics.counter("nanodb_raft_commits_total", "Total Raft log entries committed");
+    g_failovers_total = &g_metrics.counter("nanodb_failovers_total", "Total automatic primary failovers");
+
     const char* config_env = std::getenv("NANODB_CLUSTER_CONFIG");
     g_cluster_config_path = config_env ? config_env : "deploy/cluster.local.json";
 
@@ -635,9 +672,11 @@ int main() {
     std::signal(SIGTERM, signal_handler);
 
     server.Post("/vectors", [&](const httplib::Request& req, httplib::Response& res) {
+        nanodb::metrics::ScopedTimer _t(*g_insert_duration);
         if (rebalancing) {
             res.status = 503;
             res.set_content(R"({"error":"cluster is rebalancing, try again shortly"})", "application/json");
+            g_inserts_failure->inc();
             return;
         }
         try {
@@ -645,6 +684,7 @@ int main() {
             if (!body.contains("id") || !body.contains("vector")) {
                 res.status = 400;
                 res.set_content(R"({"error":"missing required fields: id, vector"})", "application/json");
+                g_inserts_failure->inc();
                 return;
             }
             std::string external_id = body["id"].is_string()
@@ -658,6 +698,7 @@ int main() {
             if (replicas.empty()) {
                 res.status = 503;
                 res.set_content(R"({"error":"destination shard unavailable"})", "application/json");
+                g_inserts_failure->inc();
                 return;
             }
 
@@ -671,19 +712,23 @@ int main() {
                 json err = {{"error", "write quorum not met"}, {"shard", shard_id},
                             {"acks", result.acks}, {"needed", result.needed}};
                 res.set_content(err.dump(), "application/json");
+                g_inserts_failure->inc();
                 return;
             }
             res.status = 201;
             json ok = {{"status", "ok"}, {"id", external_id}, {"shard", shard_id},
                        {"acks", result.acks}, {"needed", result.needed}};
             res.set_content(ok.dump(), "application/json");
+            g_inserts_success->inc();
         } catch (const json::exception& e) {
             res.status = 400;
             res.set_content(std::string(R"({"error":"invalid JSON: )") + e.what() + R"("})", "application/json");
+            g_inserts_failure->inc();
         }
     });
 
     server.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
+        nanodb::metrics::ScopedTimer _t(*g_search_duration);
         try {
             auto body = json::parse(req.body);
             if (!body.contains("vector") || !body.contains("k")) {
@@ -745,9 +790,11 @@ int main() {
                 response["unavailable_shards"] = unavailable;
             }
             res.set_content(response.dump(), "application/json");
+            g_searches_success->inc();
         } catch (const json::exception& e) {
             res.status = 400;
             res.set_content(std::string(R"({"error":"invalid JSON: )") + e.what() + R"("})", "application/json");
+            g_searches_failure->inc();
         }
     });
 
@@ -755,6 +802,7 @@ int main() {
         if (rebalancing) {
             res.status = 503;
             res.set_content(R"({"error":"cluster is rebalancing, try again shortly"})", "application/json");
+            g_deletes_failure->inc();
             return;
         }
         std::string external_id = req.matches[1];
@@ -765,6 +813,7 @@ int main() {
         if (replicas.empty()) {
             res.status = 503;
             res.set_content(R"({"error":"destination shard unavailable"})", "application/json");
+            g_deletes_failure->inc();
             return;
         }
         auto result = quorum_delete(replicas, external_id);
@@ -772,10 +821,12 @@ int main() {
             res.status = 404;
             json err = {{"error", "not found, or delete quorum not met"}, {"acks", result.acks}, {"needed", result.needed}};
             res.set_content(err.dump(), "application/json");
+            g_deletes_failure->inc();
             return;
         }
         json ok = {{"status", "ok"}, {"id", external_id}, {"acks", result.acks}, {"needed", result.needed}};
         res.set_content(ok.dump(), "application/json");
+        g_deletes_success->inc();
     });
 
     server.Get("/stats", [&](const httplib::Request&, httplib::Response& res) {
@@ -1077,6 +1128,22 @@ int main() {
             json err = {{"error", e.what()}};
             res.set_content(err.dump(), "application/json");
         }
+    });
+
+    server.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
+        if (g_raft_node) {
+            auto st = g_raft_node->status();
+            g_raft_term->set(st.term);
+            int role_val = (st.role == "leader") ? 2 : (st.role == "candidate") ? 1 : 0;
+            g_raft_role->set(role_val);
+        }
+        {
+            std::shared_lock lock(cluster_mutex);
+            std::set<int> ids;
+            for (auto& sc : g_shards) if (sc->active) ids.insert(sc->shard_id);
+            g_shards_active->set(ids.size());
+        }
+        res.set_content(g_metrics.render(), "text/plain; version=0.0.4; charset=utf-8");
     });
 
     std::cout << "[Coordinator] Listening on 0.0.0.0:" << http_port << std::endl;
