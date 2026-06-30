@@ -76,7 +76,7 @@ Cluster is up. Current leader: coordinator-0 (term=3)
   See Grafana (localhost:3000) for failover_total and vectors_total graphs.
 ```
 
-The Grafana dashboard shows `nanodb_failovers_total` tick up by 1 and `nanodb_vectors_total` never dip:
+Raft term jumps 455→456 as coordinator-1 wins the election; shard failovers=0 and insert failures=0 throughout — the Raft layer absorbed the leader kill with zero data-plane disruption:
 
 ![Grafana Dashboard](docs/images/grafana.png)
 
