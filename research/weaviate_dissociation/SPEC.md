@@ -2,7 +2,7 @@
 
 **Branch:** `experiment/weaviate-dissociation`
 **Date opened:** 2026-09-06
-**Status:** COMPLETE — **outcome (i): both axes heal.** The dissociation is met in 0 of 5 seeds once `index_recall` is scored over the full corpus and compared against a corpus-matched control. The earlier −0.5 "graph damage" was dilution. A 60 s horizon, n = 5, two seeds right-censored.
+**Status:** COMPLETE — **outcome (i): both axes heal.** The dissociation is met in 0 of 5 seeds once `index_recall` is scored over the full corpus and compared against a corpus-matched control. The earlier −0.5 "graph damage" was dilution. A 60 s horizon; the comparison is **paired** and only **3 of 5** seeds are corpus-matched (two right-censored ended with fewer objects than their controls), so the negative rests on n = 3 with a deficit bound of ~0.02 — review round 2.
 
 Issue: closes #54. Body copied verbatim below (per `research/AGENT_PIPELINE.md`'s implementer instructions — this is the issue text unmodified, not a paraphrase).
 
@@ -40,6 +40,8 @@ Four method studies (#41, #43, #46, #48) exist solely to make this runnable, and
 
 - **Topology:** 1 shard × 3 replicas, `weaviate@sha256:4d2eceef…` (digest-pinned, #46), with `verify_class()` asserting factor 3 / 1 shard so a stale auto-schema class cannot silently make it sharded-not-replicated (#46's hazard).
 - **Divergence size: 5,000 objects.** #48 found repair is size-independent, so size is free to choose on other grounds — and at 5,000 the completeness transition is a genuine ~6 s ramp rather than a sub-200 ms step, which a 1 s cadence resolves into 5–6 points. Below 500 the transition is faster than the probe and only endpoints are observable.
+
+  *(Note added 2026-09-09, #63 — the design rationale above is left as written because this is a pre-registration and records what was believed when the size was fixed. The "genuine ~6 s ramp" it cites has since been **withdrawn**: it was the span of the last three stored samples at a probe-bound ~2 s cadence. The choice of 5,000 is unaffected — the real shape, burst → ~30 s plateau → completion, is still resolvable at a 1 s cadence — but the stated reason for it is not what the data showed.)*
 - **Cadence: 1 s**, sampling `objects_present_ids` per replica (#43: 20/20 probes at 5 s with peers up, proven local; #46: per-id set, 0 false positives).
 - **Observation: ≥60 s** after the last kill, which outlasts the longest repair latency seen in #48 (~52 s).
 - **Id set ≤15,000 per probe call** — #48 found base64 ids in the URL work at 15,000 and fail *silently* at 20,000. At 5,000 there is ample margin.

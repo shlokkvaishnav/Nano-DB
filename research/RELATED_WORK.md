@@ -139,11 +139,41 @@ not available for the thing that degraded.
 **Measured directly since this was written (2026-09-06, #43/#46/#48).** Weaviate's
 hash-tree mechanism is no longer cited from documentation alone. Its repair is
 **timing-determined and independent of divergence size across 50→5,000**; the
-completeness transition is a step at 50–500 objects (≤8–167 ms) and a ~6 s ramp
-at 5,000; and at a fixed 40 s outage the latency depends on where inside the
-outage the write landed. What that does **not** yet establish is the load-bearing
-half — that object-level repair leaves the *graph* unrepaired. That is #54, and
-until it runs, §4's argument stays structural.
+completeness transition is a step at 50–500 objects (≤8–167 ms) — ~~and a ~6 s
+ramp at 5,000~~, **withdrawn 2026-09-09 (#63)**: that figure was the span of the
+last three stored samples at a probe-bound ~2 s cadence, and the real shape is
+burst → ~30 s plateau → completion. And at a fixed 40 s outage the latency
+depends on where inside the outage the write landed.
+
+**The load-bearing half has now been tested, and it did not hold (#54, PR #61).**
+§4 predicted that object-level repair leaves the *graph* unrepaired. Measured on
+Weaviate — the only system in this project with real anti-entropy — **both axes
+heal**. Against a corpus-matched control the chaos arm lost no more `index_recall`
+than the control did in any seed; on the three corpus-matched pairs the paired
+differences were 0.000, 0.000 and +0.015, two of them identical to within the
+metric's 0.005 resolution.
+
+**What survives and what does not.** The *structural* claim is untouched: every
+production anti-entropy mechanism found still operates on exact object identity,
+two correct HNSW graphs over identical data still differ bit-for-bit, and none of
+these mechanisms can be pointed at the index. What fails is the **predicted
+observable consequence** — that this must leave a measurable graph deficit after
+repair. It does not, at least on Weaviate, at 60 s, at 5,000 objects. The most
+likely reading is that re-inserting the objects rebuilds enough of the graph as a
+side effect that no deficit remains resolvable; that is null hypothesis (i) as
+#54 pre-registered it, and the mechanism is not observed.
+
+**The bound, because "both heal" is easy to overstate in the other direction.**
+One system, one pinned build, one host, a 60 s horizon, and **n = 3** matched
+pairs after two of five seeds were right-censored. The measurement resolves in
+steps of 0.005, so it excludes a chaos-specific deficit larger than **~0.02** and
+says nothing below that. This is not "anti-entropy repairs HNSW graphs"; it is
+"no residual deficit was resolvable here, at this precision, at this horizon."
+
+So §4 is now a **gap in the literature that this project tested and did not
+confirm**. That is worth more to a reader than the prediction was, and it is the
+one part of the argument that must not be quietly softened: the claim we could
+not support is stated as unsupported.
 
 This forces an honest weakening of our healing result, handled in §Framing risks.
 
