@@ -103,3 +103,94 @@ No outcome licenses a claim about *why* the dead time exists. `weaviate_repair_c
 
 - [x] Checked `README.md`'s open research questions and `research/DECISION_LOG.md` — the trajectory *shape* appears in neither; the closest entry is the 2026-09-06 re-argument that produced the claim this issue challenges.
 - [x] One answerable question: is the 5,000-object ramp figure probe-bound?
+
+---
+
+## Results
+
+**Outcome (a) on the deciding metric — the "~6 s ramp at 5,000" is a truncation artifact.** Outcomes **(c)** and **(d)** also fire, so the *replacement* decomposition proposed in the Hypothesis is **not** established.
+
+### The deciding metric
+
+`characterize.py` stores `traj[:6]` and `traj[-3:]`. Three samples span two poll intervals. Against each run's own implied interval (`repair_s / samples_in_window`):
+
+| size | seed | `repair_s` | samples | poll interval | tail span | span / 2 polls |
+|---|---|---|---|---|---|---|
+| 5000 | 35888 | 38.286 | **17** | 2.252 | **6.285** | **1.40** |
+| 5000 | 35949 | 40.787 | **22** | 1.854 | **5.791** | **1.56** |
+
+The whole 38–41 s trajectory is **17 and 22 samples**. The "5.8–6.3 s ramp" is the span of the last three of them, at a cadence the probe itself sets — the probe's cost grows with the id count, so at 5,000 objects it polls once per ~2 s. The figure is probe-bound.
+
+### What the truncation hid, and it is not a ramp
+
+Placing the stored head beside the stored tail:
+
+```
+seed 35888   head: 0.0s:140   2.4s:2500  4.7s:2500  7.1s:2500  9.4s:2500  11.7s:2500
+             tail: 32.0s:2500  35.0s:3741  38.3s:5000
+
+seed 35949   head: 0.0s:13    1.7s:1432  3.8s:2000  5.7s:2000  7.4s:2000   9.2s:2000
+             tail: 35.0s:2026  38.1s:3741  40.8s:5000
+```
+
+The trajectory is **burst → ~30 s plateau → final climb**:
+
+- **29–50% of the objects arrive within 1.7–2.4 s.**
+- The count then sits unchanged for **~30 s** — at 2,500 and at 2,000, *not* at zero.
+- The remainder arrives in the final ~6 s.
+
+So the "ramp" is the last segment of a three-phase shape, and the shape itself is new: no study here has reported that repair delivers a large fraction immediately and then stalls.
+
+### Why the proposed decomposition does not survive
+
+The Hypothesis was `repair_s = dead_time + divergence / throughput`. Three problems, all registered outcomes:
+
+**(c) The transfer phase is not linear.** OLS residuals over the dissociation transfer samples are **56.5, 265.0, 358.5, 794.3, 102.7** objects. Fitting a rate to that reports a number the data does not support; throughput is quoted below only as a range, never as a constant.
+
+**(d) The dead time does not match #56's step.** Measured from the restart (the origin #56 established), dissociation dead times are **13.5, 35.1, 36.4, 37.0, 45.4 s** — median 36.4, range 13.5–45.4 — against #56's young-regime 31.08–33.43 s. The median falls outside. **The mapping onto #56's step is withdrawn.**
+
+**The shape is wrong, not just the parameters.** There is no dead-time-then-transfer: transfer *starts immediately*, delivers a third to a half, and then stalls. A model with a leading dead time cannot describe that.
+
+### The registered segmentation rule mis-fires, and it is reported rather than patched
+
+The rule fixed in SPEC.md takes the transfer phase to begin at the last sample equal to the **first probed count**. That assumes the first probe lands on the plateau. In both 5,000-object `sizes.json` runs the first probe catches the *burst* instead (140, 13), so the rule would report a zero plateau — which is exactly what it does on dissociation seed 20260903 (plateau 0.00 s, residual 794.3, the worst fit in the set).
+
+That seed's numbers are kept and flagged rather than dropped or re-segmented under a rule invented after seeing them.
+
+### The registered control does not exist
+
+SPEC.md registered the dissociation study's no-chaos control arm as the noise floor for the probe series. **Five control runs are committed; none carries a `completeness_series`** — the harness samples the series only in the chaos branch. The registered control cannot be computed.
+
+The available substitute is weaker and internal: each chaos run's own plateau is a flat reference from the same probe on the same corpus. It bounds step artifacts; it cannot detect slow drift.
+
+### What is not reconciled
+
+`sizes.json` converges at 5,000 objects in **38.3 and 40.8 s total**. The dissociation runs show dead time ~36 s **plus** a transfer of 15–50 s, i.e. ~60 s or more — which is why two of five were right-censored at the 60 s window. The two studies disagree about total repair time at the same divergence size, and the corpora differ (5,000 vs 10,000 total objects) with cadence differing too. **This analysis cannot separate those**, and does not claim a transfer duration.
+
+## Interpretation
+
+**A live claim on `main` is wrong and is corrected here.** "Healing is a step at 50–500 objects but a ~6 s ramp at 5,000, so size decides step-vs-curve" rests on a number that measures three probe calls. The 6 s figure is retired.
+
+**What replaces it is a shape, not a rate.** At 5,000 objects repair is **burst → plateau → completion**: a third to a half of the objects land in under 2.5 s, the count then holds for ~30 s, and the rest arrives in a final climb. That is a more specific description of Weaviate's repair than anything previously in this project, and it is visible only because #54 committed full trajectories.
+
+**It sharpens rather than explains #56.** `weaviate_repair_clock/` found a ~32 s step and declined to give it a mechanism. This shows the step is not a period in which *nothing* happens — a large fraction of the data is already transferred before it begins. Whatever the ~30 s interval is, it is not the delay before transfer starts. **No mechanism is claimed**; the mapping onto #56's young-regime step is explicitly withdrawn under outcome (d).
+
+**Bounds.** Two runs at 5,000 in one study and five in another, on one pinned image, one host, one topology. The two studies' totals disagree and the confound (corpus size, cadence) is not resolvable from committed data. Every number here is an artifact of instruments built for other questions, read for a purpose they were not designed to serve.
+
+## Decision
+
+**MERGE**, as outcome (a) on the deciding metric, with the decomposition in the Hypothesis explicitly **not** adopted.
+
+**Corrections required by the Interpretation plan** — done in this PR:
+
+1. `research/weaviate_repair_window/README.md` — the "~6 s ramp at 5,000" sentence.
+2. `research/README.md` — the `weaviate_repair_window` index row carrying the same claim.
+3. `research/claim_corrections/` — a new entry, since a withdrawn claim is recorded here rather than silently overwritten.
+
+**What must not be claimed.** A transfer duration or throughput — outcome (c) fired, and the two studies' totals disagree. A mechanism for the plateau — outcome (d) fired and the mapping onto #56 is withdrawn. That the burst fraction is ~50% in general — it is 29% and 50% in two runs. That any of this holds above 5,000 objects: the 20,000-object runs in `sizes.json` never converged.
+
+**Consequences to file.**
+
+1. `method/*` — **`characterize.py` should store a decimated full trajectory, not head+tail.** Keeping six-and-three discarded the plateau that is the interesting part, and produced a published number that measured the sampler. A fixed-budget decimation (every *k*-th sample) costs the same storage and preserves shape.
+2. `experiment/*` — **the burst → plateau → completion shape deserves its own pre-registered measurement** at several divergence sizes, with a cadence chosen against the shape rather than against a total.
+3. `analysis/*` — the two studies' disagreement on total repair time at 5,000 objects (38–41 s vs ≥60 s) is unexplained and is the cleanest open question this leaves.
