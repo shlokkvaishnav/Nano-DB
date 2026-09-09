@@ -1,0 +1,92 @@
+==========================================================================
+THE DECIDING METRIC: is the stored tail a transfer phase or 3 polls?
+==========================================================================
+  characterize.py keeps traj[:6] and traj[-3:]. Three stored samples
+  span TWO poll intervals. If the tail span is about that, the
+  'ramp' is probe latency.
+
+     size   seed  repair_s  samples  poll_int  tail span  span/2 polls
+       50   1028    44.725     8532   0.00524      0.016          1.53
+       50   1083     0.008        2   0.00400      0.008          1.00
+       50   1096     0.010        2   0.00500      0.010          1.00
+      500   4256     0.169        4   0.04225      0.129          1.53
+      500   4268    50.234     3701   0.01357      0.167          6.15
+      500   4330    50.047     4313   0.01160      0.106          4.57
+     5000  35888    38.286       17   2.25212      6.285          1.40
+     5000  35949    40.787       22   1.85395      5.791          1.56
+
+  ratio ~1.0 => the stored tail IS two poll intervals, i.e. the
+  number is probe-bound and measures nothing about transfer.
+    size     50: mean ratio 1.18 over 3 run(s)
+    size    500: mean ratio 4.08 over 3 run(s)
+    size   5000: mean ratio 1.48 over 2 run(s)
+
+==========================================================================
+THE SHAPE THE TRUNCATION HID (5,000-object runs, head + tail)
+==========================================================================
+  characterize.py keeps the first six samples and the last three. Put
+  them side by side and the trajectory is not a ramp at all.
+
+  seed 35888  (repair_s 38.286, 17 samples total)
+    head: 0.0s:140  2.4s:2500  4.7s:2500  7.1s:2500  9.4s:2500  11.7s:2500
+    ...gap the harness did not store...
+    tail: 32.0s:2500  35.0s:3741  38.3s:5000
+    -> 2500 of 5000 objects arrive by t=2.4s (50%), then the count sits at 2500 until t=32.0s,
+       then climbs to 5000 by t=38.3s.
+  seed 35949  (repair_s 40.787, 22 samples total)
+    head: 0.0s:13  1.7s:1432  3.8s:2000  5.7s:2000  7.4s:2000  9.2s:2000
+    ...gap the harness did not store...
+    tail: 35.0s:2026  38.1s:3741  40.8s:5000
+    -> 1432 of 5000 objects arrive by t=1.7s (29%), then the count sits at 2000 until t=35.0s,
+       then climbs to 5000 by t=40.8s.
+
+  So the trajectory is BURST -> ~30 s PLATEAU -> FINAL CLIMB, and the
+  quantity reported as 'a ~6 s ramp' is only the final climb. It is
+  not a transfer duration and it is not the whole shape.
+
+  NOTE this also breaks the segmentation rule SPEC.md registered,
+  which assumes the first probed count IS the plateau count. Here the
+  first probe (140, 13) catches the burst instead, so the same rule
+  would report a zero plateau -- which is exactly what it does on
+  dissociation seed 20260903 below. A registered rule that mis-fires
+  on a known case is reported, not quietly patched.
+
+==========================================================================
+THE FULL TRAJECTORIES (dissociation, 5,000-object divergence)
+==========================================================================
+  'dead time' is measured FROM THE RESTART (t=0), not from the first
+  successful probe: #56's clock is restart-anchored, so a plateau timed
+  from the first answer would understate it by however long the victim
+  spent unreachable. Those failed probes are counted separately.
+
+        seed  probes  failed  cadence  1st ok  deadtime  transfer_s    obj/s    resid  censored
+    20260900      33       6     1.73     7.2     36.42       26.00    117.5     56.5     right
+    20260901      18       5     3.09     8.3     35.11       25.74    180.1    265.0      none
+    20260902      25       5     2.24     6.7     37.00       23.55    188.7    358.5      none
+    20260903      14      10     3.88    13.5     13.47       50.48    128.5    794.3      none
+    20260904      24      10     1.78    19.9     45.42       15.55     49.0    102.7     right
+
+  DEAD TIME from restart to transfer start: 13.5-45.4 s, median 36.4 s
+  weaviate_repair_clock/ (#56) young-regime step: ~32 s (observed 31.08-33.43, timed from the same origin)
+  -> median falls OUTSIDE #56's observed range. Under SPEC.md
+     outcome (d) the mapping onto #56's step is WITHDRAWN, or
+     held only where the ranges overlap. Stated, not smoothed.
+  transfer throughput: 49-189 obj/s, median 129
+  implied transfer time for 5,000 objects at the median rate: 38.9 s
+
+==========================================================================
+THE REGISTERED CONTROL IS NOT AVAILABLE
+==========================================================================
+  SPEC.md registered the dissociation study's no-chaos control arm as
+  the noise floor: a control run's count should be flat across the
+  window. 5 control runs are committed and 0 carry a
+  completeness_series -- the harness samples the series only in the
+  chaos branch, so the registered control DOES NOT EXIST in the data.
+  Reported rather than silently substituted.
+
+  The available substitute is internal and weaker: each chaos run's
+  own PLATEAU is a flat reference measured by the same probe on the
+  same corpus. If the probe manufactured climbs, the plateau would not
+  be flat. Every run's plateau is exactly constant by construction of
+  the segmentation rule, so this cannot detect a slow drift -- it
+  bounds step artifacts only.
