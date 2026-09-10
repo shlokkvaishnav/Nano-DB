@@ -310,7 +310,15 @@ def main(argv=None) -> int:
                     # about to test. Added 2026-09-10 (#67), after arming the
                     # registry produced six failures and every one of them was
                     # a quotation in a spec that retired the claim.
-                    if quoted(line, phrase):
+                    # Narrowed to SPEC.md in review round 1 (#67). Every site
+                    # that actually needs this exemption is a spec quoting the
+                    # claim it is about to test -- six of them, and nothing
+                    # else. In a POSITIONING document a quoted claim is often an
+                    # endorsement rather than a report ("recent work confirms
+                    # 'a 6 s ramp'"), and exempting that pattern in
+                    # RELATED_WORK.md or a README would wave through exactly the
+                    # thing a human grep is worst at spotting.
+                    if rel.endswith("SPEC.md") and quoted(line, phrase):
                         continue
                     fails.append(
                         f"[5] {rel}:{i} states a retired claim without a "

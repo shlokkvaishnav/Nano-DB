@@ -220,6 +220,30 @@ def t_draft_still_fires(tmp):
     return code == 1 and "[1]" in out, out
 
 
+@case("[5] a spec QUOTING the claim it tests passes (exemption works where meant)")
+def t_retired_quoted_in_spec(tmp):
+    # A pre-registration must name the claim it is about to retire. Six real
+    # sites do exactly this; without the exemption every one of them fails.
+    quoted_q = '## Research question\nIs the "must beat 0.3s" figure real?\n'
+    spec = SPEC_OK.replace("## Research question", quoted_q)
+    research = build(tmp, spec=spec, retired="must beat 0.3s :: #48\n")
+    code, out = run(research)
+    return code == 0, out
+
+
+@case("[5] a QUOTED claim outside a spec still fails (endorsement is not a report)")
+def t_retired_quoted_outside_spec(tmp):
+    # Narrowed in review round 1 of #67. In a positioning document a quoted
+    # claim is often an endorsement -- 'recent work confirms "X"' asserts X --
+    # and that is the pattern a human grep is worst at spotting, so it must not
+    # be exempt outside SPEC.md.
+    endorsement = 'Recent work confirms "must beat 0.3s" and we build on it.\n'
+    research = build(tmp, retired="must beat 0.3s :: #48\n",
+                     extra_md=endorsement)
+    code, out = run(research)
+    return code == 1 and "[5]" in out, out
+
+
 def main() -> int:
     passed = failed = 0
     for name, fn in CASES:
