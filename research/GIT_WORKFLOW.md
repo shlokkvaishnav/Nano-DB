@@ -16,6 +16,12 @@ A branch is not merged because it works or produces a better number. It is merge
 
 Don't create a branch for a cosmetic or purely-editorial change — those go straight to `main` via normal review. Do create one whenever a change could affect an experimental conclusion (see **Isolation**, below).
 
+**SETUP GOES STRAIGHT TO `main` (owner decision, 2026-09-10).** No branch, no PR, no review round. *Setup* is the machinery rather than the findings: tooling and checkers (`check_research.py`, `check_index.py`, their tests), CI config, this document and `AGENT_PIPELINE.md`, hooks, and harness scaffolding that produces no claim. **Research still takes the full path** — spec, branch, PR, review, manual merge.
+
+The reasoning is cost, not a lower bar. A checker either passes its own tests or it does not, so the outcome is mechanically visible rather than a matter of judgement, and PR #68 spent two review rounds on a one-line predicate. What does not change: run `check_research.py`, `check_index.py` and `test_check_research.py` before pushing, and write the commit message to the standard a PR body would have met — for a setup change the commit message *is* the audit trail.
+
+**If a change touches both setup and a research claim, it is research.** Branch it. This is the existing "formatting and research must never share a branch" rule read in the other direction, and it is the case where the shortcut would actually cost something.
+
 ## Before writing code: the spec
 
 A substantial branch (`research/*`, most `experiment/*`) starts with a filled-out copy of [`SPEC_TEMPLATE.md`](SPEC_TEMPLATE.md), committed before the implementation that answers it. The point of committing the spec first is that it timestamps the hypothesis — a hypothesis written after seeing the result is not a hypothesis, it's a caption. If a branch turns exploratory partway through (an unexpected observation redirects it), say so explicitly in the spec and in the final writeup; do not backfill a clean hypothesis once the answer is known.
