@@ -127,15 +127,36 @@ def main() -> int:
               f"paired differences {[round(x, 4) for x in paired]}")
         print(f"  mean {statistics.mean(paired):+.4f} -- a NEGATIVE value would "
               "mean chaos lost MORE index_recall than its control")
-        print("  Chaos never loses more; in 2 of 3 the arms are IDENTICAL.")
+        # Computed, not asserted. This line was hardcoded from #54's data and
+        # kept claiming "never loses more, 2 of 3 identical" against #69's
+        # results, where chaos loses more in 2 of 5. Prose in an analyser is as
+        # capable of going stale as a constant is.
+        worse = [x for x in paired if x < 0]
+        ident = [x for x in paired if x == 0]
+        if not worse:
+            print(f"  Chaos never loses more; {len(ident)} of {len(paired)} "
+                  "arms are IDENTICAL.")
+        else:
+            mags = ", ".join(f"{abs(x):.3f}" for x in sorted(worse))
+            print(f"  Chaos loses MORE in {len(worse)} of {len(paired)} seeds "
+                  f"(by {mags}).")
+            print("  Read the mean and the signs together, not the count: a "
+                  "per-seed sign")
+            print("  test discards magnitude, and differences straddling zero "
+                  "with a mean")
+            print("  near zero are what a null looks like at this resolution.")
 
     # ---- what this can and cannot exclude, exactly --------------------------
-    nq = (base[0].get("index_recall_before") or {}).get("queries") if base else None
+    snap = (base[0].get("index_recall_before") or {}) if base else {}
+    nq = snap.get("queries")
+    # k is read from the record, not mirrored. Runs written before k was
+    # recorded fall back to 10, which is what those runs used.
+    kk = snap.get("k", 10)
     if nq and paired:
-        step = 1.0 / (nq * 10)
+        step = 1.0 / (nq * kk)
         bound = max(2 * step, max(abs(x) for x in paired)) + step
-        print(f"\n  RESOLUTION: {nq} queries x top-10 = {nq * 10} ground-truth "
-              f"items, so index_recall moves in steps of 1/{nq * 10} = {step:.4f}.")
+        print(f"\n  RESOLUTION: {nq} queries x top-{kk} = {nq * kk} ground-truth "
+              f"items, so index_recall moves in steps of 1/{nq * kk} = {step:.4f}.")
         print(f"  Largest chaos-specific deficit consistent with these pairs: "
               f"under ~{bound:.3f}.")
         print("  It does NOT exclude a deficit below the quantisation floor.")
@@ -144,8 +165,15 @@ def main() -> int:
 
     ba = [ir(r, "after") for r in base]
     ca = [ir(r, "after") for r in chaos]
-    print(f"\n  (unpaired, REFERENCE ONLY -- contaminated by the two unmatched "
-          f"seeds: baseline {statistics.mean(ba):.4f} vs chaos "
+    # The reason it is reference-only depends on the data: #54 had two unmatched
+    # seeds contaminating it; #69 has none, and it is still the wrong test
+    # because it throws away the per-seed pairing the design produces.
+    n_unmatched = len(chaos) - len(paired)
+    why = (f"contaminated by the {n_unmatched} unmatched seed(s)" if n_unmatched
+           else "every seed is corpus-matched here, but it still discards the "
+                "per-seed pairing the design produces")
+    print(f"\n  (unpaired, REFERENCE ONLY -- {why}: "
+          f"baseline {statistics.mean(ba):.4f} vs chaos "
           f"{statistics.mean(ca):.4f}, p = {mannwhitney_exact(ba, ca):.4f})")
 
     # ---- the pre-registered primary metric ----------------------------------
@@ -178,8 +206,11 @@ def main() -> int:
 
     # ---- what the design cannot say -----------------------------------------
     print("\n=== the horizon this cannot see past ===")
-    print("  index_recall_after is snapshotted when the 60s completeness window")
-    print("  closes. So the supported claim is 'at ~60s, completeness has healed")
+    # Read from the data, not hardcoded: #69 runs a 180s window and this section
+    # kept saying 60s.
+    obs = (chaos[0].get("observe_s") if chaos else None) or 60
+    print(f"  index_recall_after is snapshotted when the {obs:g}s completeness window")
+    print(f"  closes. So the supported claim is 'at ~{obs:g}s, completeness has healed")
     print("  and index_recall has not' -- a statement about a HORIZON, not about")
     print("  permanence. #37 is the precedent: Qdrant graph damage that a 50s")
     print("  window called permanent was gone by 180s. A long-quiesce re-run is")

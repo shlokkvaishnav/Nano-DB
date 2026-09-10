@@ -1,0 +1,62 @@
+runs: 10
+
+=== control: no chaos, same two snapshots ===
+        seed   before    after    drift
+    20260900    0.962    0.915   -0.047
+    20260901    0.980    0.927   -0.053
+    20260902    0.972    0.923   -0.049
+    20260903    0.972    0.925   -0.047
+    20260904    0.980    0.921   -0.059
+
+  max |drift| = 0.0590 over 5 seeds
+  The measurement is stable when nothing happens. That is what makes
+  a drop under chaos attributable to the chaos.
+
+=== chaos: the two axes, per seed ===
+        seed  IR before  IR after  IR delta  comp_end  censored  recovery_s
+    20260900      0.961     0.916    -0.045      1.00      none       44.49
+    20260901      0.981     0.919    -0.062      1.00      none       40.90
+    20260902      0.970     0.918    -0.052      1.00      none       45.85
+    20260903      0.973     0.929    -0.044      1.00      none       41.96
+    20260904      0.980     0.927    -0.053      1.00      none       38.34
+
+=== the paired comparison, corpus-matched seeds only ===
+        seed  ctl held  chaos held  matched  ctl delta  chaos delta  paired diff
+    20260900     10000       10000      yes     -0.047       -0.045       +0.002
+    20260901     10000       10000      yes     -0.053       -0.062       -0.009
+    20260902     10000       10000      yes     -0.049       -0.052       -0.003
+    20260903     10000       10000      yes     -0.047       -0.044       +0.003
+    20260904     10000       10000      yes     -0.059       -0.053       +0.006
+
+  corpus-matched pairs: n = 5   paired differences [0.002, -0.009, -0.003, 0.003, 0.006]
+  mean -0.0002 -- a NEGATIVE value would mean chaos lost MORE index_recall than its control
+  Chaos loses MORE in 2 of 5 seeds (by 0.009, 0.003).
+  Read the mean and the signs together, not the count: a per-seed sign
+  test discards magnitude, and differences straddling zero with a mean
+  near zero are what a null looks like at this resolution.
+
+  RESOLUTION: 100 queries x top-10 = 1000 ground-truth items, so index_recall moves in steps of 1/1000 = 0.0010.
+  Largest chaos-specific deficit consistent with these pairs: under ~0.010.
+  It does NOT exclude a deficit below the quantisation floor.
+  More queries per snapshot lowers that floor at no cluster cost,
+  and is the cheapest available improvement.
+
+  (unpaired, REFERENCE ONLY -- every seed is corpus-matched here, but it still discards the per-seed pairing the design produces: baseline 0.9222 vs chaos 0.9218, p = 1.0000)
+
+=== the pre-registered dissociation, per seed ===
+  (completeness returned to 1.0 within the window AND the chaos arm lost MORE index_recall than its corpus-matched control)
+    seed 20260900: healed=True  chaos_delta=-0.045  control_delta=-0.047  graph_damaged_beyond_control=False  -> no
+    seed 20260901: healed=True  chaos_delta=-0.062  control_delta=-0.053  graph_damaged_beyond_control=True  -> DISSOCIATION
+    seed 20260902: healed=True  chaos_delta=-0.052  control_delta=-0.049  graph_damaged_beyond_control=True  -> DISSOCIATION
+    seed 20260903: healed=True  chaos_delta=-0.044  control_delta=-0.047  graph_damaged_beyond_control=False  -> no
+    seed 20260904: healed=True  chaos_delta=-0.053  control_delta=-0.059  graph_damaged_beyond_control=False  -> no
+
+  2 of 5 seeds show the dissociation.
+
+=== the horizon this cannot see past ===
+  index_recall_after is snapshotted when the 180s completeness window
+  closes. So the supported claim is 'at ~180s, completeness has healed
+  and index_recall has not' -- a statement about a HORIZON, not about
+  permanence. #37 is the precedent: Qdrant graph damage that a 50s
+  window called permanent was gone by 180s. A long-quiesce re-run is
+  the experiment that would settle it, and it has not been done.

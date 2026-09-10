@@ -56,12 +56,31 @@ PEERS = (0, 1)
 # From #48, all measured rather than chosen. See SPEC.md.
 DIVERGENCE = 5_000      # size-independent repair, but 5k gives a resolvable ramp
 CADENCE_S = 1.0         # #43: 5 s proven; 1 s resolves the ~6 s ramp at this size
-OBSERVE_S = 60.0        # young-regime wait is ~32 s (#56); the slowest repair
-                        # seen anywhere is 53.3 s, so the margin is 6.7 s, not
-                        # comfortable. Amendment 1: a series that never completes
-                        # is RIGHT-censored, not a failure to heal.
+OBSERVE_S = 60.0        # #54's value, kept as the DEFAULT so that study stays
+                        # reproducible from its own committed results. #69 runs
+                        # 180 s via --observe-s: at 60 s the margin was 6.7 s
+                        # against the slowest repair seen anywhere (53.3 s), and
+                        # #54 duly right-censored 2 of 5 seeds, with observed
+                        # recovery at 40.08-60.55 s -- one past nominal.
+                        # Amendment 1 applies at any window: a series that never
+                        # completes is RIGHT-censored, not a failure to heal.
 ID_CAP = 15_000         # base64 ids in the URL fail SILENTLY above this
 K = 10
+
+# index_recall quantises at 1 / (N_QUERIES * K). At 20 queries that is
+# 1/200 = 0.005, and #54's whole result lives inside that granularity: the
+# paired chaos-vs-control differences were 0.000, 0.000 and +0.015 -- zero,
+# zero, and three steps. A bound of "under ~0.02" is a statement about the
+# RULER, not about Weaviate.
+#
+# Raising the count lowers the floor directly and costs no cluster time: the
+# isolation probe is already paused and the corpus already loaded, so each extra
+# query is one more GraphQL call in a window that is otherwise idle. #61's
+# review named this the cheapest available improvement.
+#
+# 20 is kept as the DEFAULT so #54 stays reproducible. #69 runs 100 via
+# --queries, giving 1/1000 = 0.001, a 5x finer floor.
+N_QUERIES = 20
 
 
 def log(m):
@@ -193,6 +212,10 @@ def index_recall_snapshot(node, shard, ids, vecs, queries, dry, distance="cosine
             tot += len(truth)
         return {"index_recall": (hits / tot) if tot else None,
                 "held": int(len(held_idx)), "queries": len(queries),
+                # Recorded so the analyser derives the resolution floor rather
+                # than mirroring K. A constant duplicated in two files is the
+                # defect #17's review found in the kill scheduler.
+                "k": K,
                 "distance": distance}
     finally:
         for p in PEERS:
@@ -248,6 +271,29 @@ def recovery_with_censoring(series):
     out["censored"] = "none"
     out["recovery_s"] = complete[0]["t"]
     return out
+
+
+def wait_full_membership(expect=3, timeout_s=120, node=0):
+    """Block until all `expect` nodes are back in schema membership.
+
+    `wait_ready()` answers "is the HTTP port serving", which a node does before
+    it has rejoined the schema's replica set. This asks the question that
+    actually governs replica placement.
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        st, d = t.http_request(t.http_port(node), "GET", "/v1/nodes?output=verbose",
+                               None, timeout=20)
+        nodes = (d or {}).get("nodes") or []
+        healthy = [n for n in nodes if n.get("status") == "HEALTHY"]
+        if len(healthy) >= expect:
+            waited = time.time() - t0
+            if waited > 2:
+                log(f"  waited {waited:.0f}s for {expect}/{expect} membership")
+            return True
+        time.sleep(3)
+    log(f"  TIMEOUT after {timeout_s}s waiting for {expect}/{expect} membership")
+    return False
 
 
 def shard_for_class(cls, node=0):
@@ -362,7 +408,8 @@ def class_count(node=0):
 BASELINE_INDEX_RECALL_FLOOR = 0.90
 
 
-def one_run(seed, chaos, shard, dry, distance="cosine"):
+def one_run(seed, chaos, shard, dry, distance="cosine",
+            observe_s=OBSERVE_S, n_queries=N_QUERIES):
     """One seed, one condition.
 
     Two disjoint id sets, and the distinction is load-bearing:
@@ -403,9 +450,13 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
     all_ids = list(base_ids) + list(div_ids)
     all_vecs = np.concatenate([base_vecs, div_vecs], axis=0)
     rng = np.random.default_rng(seed + 1)
-    queries = rng.standard_normal((20, t.VECTOR_DIM)).astype(np.float32)
+    queries = rng.standard_normal((n_queries, t.VECTOR_DIM)).astype(np.float32)
+    # Instrument parameters recorded per run, so the analyser derives the
+    # resolution and the horizon from the artifact instead of a constant that
+    # may since have changed. #63 is the standing lesson: a published number
+    # that came from a sampler setting nobody recorded.
     rec = {"seed": seed, "chaos": chaos, "divergence": DIVERGENCE,
-           "distance": distance}
+           "distance": distance, "observe_s": observe_s, "n_queries": n_queries}
 
     log("")
     # Amendment 2: the class is shared scratch and was never cleared, so the
@@ -429,7 +480,43 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
     # every node up, not while the isolation probe has peers paused.
     cls = f"RrdV{seed}{'Chaos' if chaos else 'Ctl'}"
     if not dry:
+        # WAIT FOR FULL MEMBERSHIP BEFORE CREATING THE CLASS.
+        #
+        # The previous run's chaos arm restarts the victim at the end. Creating
+        # the next run's class immediately places its shard on whatever nodes
+        # are in schema membership *at that instant* -- and a node that is
+        # HTTP-ready is not necessarily back in the membership yet. #69 lost 5
+        # of 10 runs to this: node2 was 6 minutes into a restart while its peers
+        # had been up 58, and the class landed on 2 of 3 replicas.
+        #
+        # The placement guard below caught every one of them, which is the
+        # difference from the silent "cannot achieve consistency level ALL"
+        # partial writes that preceded it. But an abort is the wrong response to
+        # something that resolves itself in seconds, so wait first and keep the
+        # abort as the backstop.
+        if not wait_full_membership():
+            rec["aborted"] = "cluster did not reach 3/3 membership"
+            return rec
         t.CLASS_NAME = cls
+        # DELETE BEFORE CREATE. Amendment 4 promised "a fresh class per run" and
+        # only ever created one -- create_class() tolerates an existing class
+        # (it returns 200 with "class already existed with the expected
+        # config"), so a re-run silently INHERITS the previous attempt's
+        # populated class.
+        #
+        # #69 attempt 2 lost 5 of 10 runs to exactly this: every run whose
+        # attempt-1 counterpart had COMPLETED read `before == after`, because
+        # the before-snapshot was taken on a corpus that already held 10,000
+        # objects. Every run whose counterpart had ABORTED was correct. The
+        # correlation was perfect, which is what identified it.
+        #
+        # Third recurrence of stale state silently reused in this study, after
+        # the 14,200-object corpus leak (Amendment 2) and the batch-delete
+        # tombstones (Amendment 4). The common shape: a cleanup that is
+        # tolerant rather than assertive.
+        t.http_request(t.http_port(0), "DELETE", f"/v1/schema/{cls}",
+                       None, timeout=60)
+        time.sleep(2)
         st, resp = t.create_class(0)
         if st != 200:
             log(f"  FAILED to create {cls}: {st} {resp}")
@@ -448,6 +535,11 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
                 f"holders={holders}/3")
             rec["aborted"] = f"class placed on {holders}/3 replicas"
             return rec
+        n0 = class_count()
+        if n0:
+            log(f"  FAILED: {cls} holds {n0} objects at creation, expected 0")
+            rec["aborted"] = f"class not empty at creation ({n0} objects)"
+            return rec
         shard = shard_for_class(cls)
         if not shard:
             log(f"  FAILED: no shard found for {cls}")
@@ -455,7 +547,22 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
             return rec
         rec["class"] = cls
         rec["shard"] = shard
-        log(f"  fresh class {cls}, shard {shard}, 3/3 replicas")
+        # Read the metric from the class THIS RUN created, not from whatever
+        # existed at startup. Amendment 4 gives each run its own class, so a
+        # startup read describes a different object -- and on a clean cluster
+        # there is no object at all. Same principle as Amendment 2: derive the
+        # value from the artifact being measured, never duplicate it.
+        live = schema_distance(0)
+        if not live:
+            log(f"  FAILED: cannot read distance metric for {cls}")
+            rec["aborted"] = "distance metric unreadable"
+            return rec
+        if live != distance:
+            log(f"  note: distance for {cls} is {live!r} (startup saw "
+                f"{distance!r}); using the class's own value")
+        distance = live
+        rec["distance"] = distance
+        log(f"  fresh class {cls}, shard {shard}, 3/3 replicas, distance {distance}")
     log(f"--- seed {seed} chaos={chaos} ---")
     log(f"  writing BASE corpus ({DIVERGENCE} ids) at consistency ALL")
     if not dry:
@@ -520,10 +627,10 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
             origin = time.time()
 
         log(f"  sampling completeness over the DIVERGENCE set every "
-            f"{CADENCE_S}s for {OBSERVE_S}s from the restart")
+            f"{CADENCE_S}s for {observe_s}s from the restart")
         series = []
         if not dry:
-            end = origin + OBSERVE_S
+            end = origin + observe_s
             while time.time() < end:
                 ok, got = objects_present_ids(VICTIM, shard, div_ids[:ID_CAP])
                 series.append({"t": round(time.time() - origin, 2),
@@ -566,6 +673,13 @@ def main() -> int:
                     help="repeatable; default is 5 pre-registered seeds")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
+    # Instrument parameters, overridable so a re-run at a different horizon or
+    # resolution does not have to edit the file and silently change what an
+    # earlier study reproduces. Both are recorded per run.
+    ap.add_argument("--observe-s", type=float, default=OBSERVE_S,
+                    help=f"observation window seconds (default {OBSERVE_S})")
+    ap.add_argument("--queries", type=int, default=N_QUERIES,
+                    help=f"queries per index_recall snapshot (default {N_QUERIES})")
     a = ap.parse_args()
     seeds = a.seed or [20260900, 20260901, 20260902, 20260903, 20260904]
     os.makedirs(a.out, exist_ok=True)
@@ -573,31 +687,52 @@ def main() -> int:
     if not a.dry_run:
         okc, info = t.verify_class(0)
         log(f"topology check (#46's hazard): {okc}  {info}")
-        if not okc:
-            log("REFUSING TO RUN: the class is not factor 3 / 1 shard. A stale "
-                "auto-schema class would give per-replica numbers from a "
-                "topology with no replicas.")
+        # A MISSING class is fine; a WRONGLY-SHAPED one is not.
+        #
+        # This check predates Amendment 4, when the study used one long-lived
+        # class and a stale auto-schema version of it was the hazard (#46:
+        # factor 1 with 3 shards, i.e. sharded rather than replicated, so
+        # "what does replica N hold" was not even the right question).
+        #
+        # Amendment 4 gives every run its own fresh class and verifies factor 3
+        # / 1 shard AND 3-of-3 replica placement before writing a single object.
+        # So on a clean cluster there is nothing here to check yet, and failing
+        # on 404 refuses to run for the one reason that cannot be a stale class:
+        # no class at all. Found by rebuilding the cluster from scratch for #69.
+        absent = isinstance(info, dict) and info.get("status") == 404
+        if not okc and not absent:
+            log("REFUSING TO RUN: the class exists and is not factor 3 / 1 "
+                "shard. A stale auto-schema class would give per-replica "
+                "numbers from a topology with no replicas.")
             return 2
+        if absent:
+            log("  no pre-existing class -- each run creates and verifies its "
+                "own (Amendment 4), so there is nothing stale to inherit.")
 
     distance = "cosine"
     if not a.dry_run:
         distance = schema_distance(0) or ""
-        log(f"index distance metric (read from the live schema): {distance!r}")
-        if not distance:
-            log("REFUSING TO RUN: could not read the class's distance metric. "
-                "Ground truth computed under the wrong metric is not a recall "
-                "measurement (Amendment 2).")
-            return 2
+        if distance:
+            log(f"index distance metric (read from the live schema): {distance!r}")
+        else:
+            # No class yet, so nothing to read. Not fatal since Amendment 4:
+            # each run creates its own class and reads the metric back from it
+            # before measuring anything. The per-run read is the one that
+            # governs; this is only an early warning.
+            distance = "cosine"
+            log("index distance metric: no class yet -- each run reads it from "
+                "the class it creates (Amendment 4)")
         log(f"class holds {class_count()} objects before reset")
 
     shard = ia.shard_name(0) if not a.dry_run else "DRYSHARD"
     log(f"shard: {shard}   divergence: {DIVERGENCE}   cadence: {CADENCE_S}s   "
-        f"observe: {OBSERVE_S}s")
+        f"observe: {a.observe_s}s   queries/snapshot: {a.queries}")
 
     rows = []
     for seed in seeds:
         for chaos in (False, True):        # the no-chaos control is REQUIRED
-            rows.append(one_run(seed, chaos, shard, a.dry_run, distance))
+            rows.append(one_run(seed, chaos, shard, a.dry_run, distance,
+                                a.observe_s, a.queries))
             with open(os.path.join(a.out, "dissociation.json"), "w") as f:
                 json.dump(rows, f, indent=1)
     log(f"\nwrote {os.path.join(a.out, 'dissociation.json')}")

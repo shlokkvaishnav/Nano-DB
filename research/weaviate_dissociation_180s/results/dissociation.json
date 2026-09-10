@@ -1,0 +1,12 @@
+[
+ {
+  "seed": 20260900,
+  "chaos": false,
+  "divergence": 5000,
+  "distance": "cosine",
+  "observe_s": 180.0,
+  "n_queries": 100,
+  "index_recall_before": null,
+  "index_recall_after": null
+ }
+]
