@@ -56,12 +56,31 @@ PEERS = (0, 1)
 # From #48, all measured rather than chosen. See SPEC.md.
 DIVERGENCE = 5_000      # size-independent repair, but 5k gives a resolvable ramp
 CADENCE_S = 1.0         # #43: 5 s proven; 1 s resolves the ~6 s ramp at this size
-OBSERVE_S = 60.0        # young-regime wait is ~32 s (#56); the slowest repair
-                        # seen anywhere is 53.3 s, so the margin is 6.7 s, not
-                        # comfortable. Amendment 1: a series that never completes
-                        # is RIGHT-censored, not a failure to heal.
+OBSERVE_S = 60.0        # #54's value, kept as the DEFAULT so that study stays
+                        # reproducible from its own committed results. #69 runs
+                        # 180 s via --observe-s: at 60 s the margin was 6.7 s
+                        # against the slowest repair seen anywhere (53.3 s), and
+                        # #54 duly right-censored 2 of 5 seeds, with observed
+                        # recovery at 40.08-60.55 s -- one past nominal.
+                        # Amendment 1 applies at any window: a series that never
+                        # completes is RIGHT-censored, not a failure to heal.
 ID_CAP = 15_000         # base64 ids in the URL fail SILENTLY above this
 K = 10
+
+# index_recall quantises at 1 / (N_QUERIES * K). At 20 queries that is
+# 1/200 = 0.005, and #54's whole result lives inside that granularity: the
+# paired chaos-vs-control differences were 0.000, 0.000 and +0.015 -- zero,
+# zero, and three steps. A bound of "under ~0.02" is a statement about the
+# RULER, not about Weaviate.
+#
+# Raising the count lowers the floor directly and costs no cluster time: the
+# isolation probe is already paused and the corpus already loaded, so each extra
+# query is one more GraphQL call in a window that is otherwise idle. #61's
+# review named this the cheapest available improvement.
+#
+# 20 is kept as the DEFAULT so #54 stays reproducible. #69 runs 100 via
+# --queries, giving 1/1000 = 0.001, a 5x finer floor.
+N_QUERIES = 20
 
 
 def log(m):
@@ -193,6 +212,10 @@ def index_recall_snapshot(node, shard, ids, vecs, queries, dry, distance="cosine
             tot += len(truth)
         return {"index_recall": (hits / tot) if tot else None,
                 "held": int(len(held_idx)), "queries": len(queries),
+                # Recorded so the analyser derives the resolution floor rather
+                # than mirroring K. A constant duplicated in two files is the
+                # defect #17's review found in the kill scheduler.
+                "k": K,
                 "distance": distance}
     finally:
         for p in PEERS:
@@ -362,7 +385,8 @@ def class_count(node=0):
 BASELINE_INDEX_RECALL_FLOOR = 0.90
 
 
-def one_run(seed, chaos, shard, dry, distance="cosine"):
+def one_run(seed, chaos, shard, dry, distance="cosine",
+            observe_s=OBSERVE_S, n_queries=N_QUERIES):
     """One seed, one condition.
 
     Two disjoint id sets, and the distinction is load-bearing:
@@ -403,9 +427,13 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
     all_ids = list(base_ids) + list(div_ids)
     all_vecs = np.concatenate([base_vecs, div_vecs], axis=0)
     rng = np.random.default_rng(seed + 1)
-    queries = rng.standard_normal((20, t.VECTOR_DIM)).astype(np.float32)
+    queries = rng.standard_normal((n_queries, t.VECTOR_DIM)).astype(np.float32)
+    # Instrument parameters recorded per run, so the analyser derives the
+    # resolution and the horizon from the artifact instead of a constant that
+    # may since have changed. #63 is the standing lesson: a published number
+    # that came from a sampler setting nobody recorded.
     rec = {"seed": seed, "chaos": chaos, "divergence": DIVERGENCE,
-           "distance": distance}
+           "distance": distance, "observe_s": observe_s, "n_queries": n_queries}
 
     log("")
     # Amendment 2: the class is shared scratch and was never cleared, so the
@@ -520,10 +548,10 @@ def one_run(seed, chaos, shard, dry, distance="cosine"):
             origin = time.time()
 
         log(f"  sampling completeness over the DIVERGENCE set every "
-            f"{CADENCE_S}s for {OBSERVE_S}s from the restart")
+            f"{CADENCE_S}s for {observe_s}s from the restart")
         series = []
         if not dry:
-            end = origin + OBSERVE_S
+            end = origin + observe_s
             while time.time() < end:
                 ok, got = objects_present_ids(VICTIM, shard, div_ids[:ID_CAP])
                 series.append({"t": round(time.time() - origin, 2),
@@ -566,6 +594,13 @@ def main() -> int:
                     help="repeatable; default is 5 pre-registered seeds")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
+    # Instrument parameters, overridable so a re-run at a different horizon or
+    # resolution does not have to edit the file and silently change what an
+    # earlier study reproduces. Both are recorded per run.
+    ap.add_argument("--observe-s", type=float, default=OBSERVE_S,
+                    help=f"observation window seconds (default {OBSERVE_S})")
+    ap.add_argument("--queries", type=int, default=N_QUERIES,
+                    help=f"queries per index_recall snapshot (default {N_QUERIES})")
     a = ap.parse_args()
     seeds = a.seed or [20260900, 20260901, 20260902, 20260903, 20260904]
     os.makedirs(a.out, exist_ok=True)
@@ -592,12 +627,13 @@ def main() -> int:
 
     shard = ia.shard_name(0) if not a.dry_run else "DRYSHARD"
     log(f"shard: {shard}   divergence: {DIVERGENCE}   cadence: {CADENCE_S}s   "
-        f"observe: {OBSERVE_S}s")
+        f"observe: {a.observe_s}s   queries/snapshot: {a.queries}")
 
     rows = []
     for seed in seeds:
         for chaos in (False, True):        # the no-chaos control is REQUIRED
-            rows.append(one_run(seed, chaos, shard, a.dry_run, distance))
+            rows.append(one_run(seed, chaos, shard, a.dry_run, distance,
+                                a.observe_s, a.queries))
             with open(os.path.join(a.out, "dissociation.json"), "w") as f:
                 json.dump(rows, f, indent=1)
     log(f"\nwrote {os.path.join(a.out, 'dissociation.json')}")

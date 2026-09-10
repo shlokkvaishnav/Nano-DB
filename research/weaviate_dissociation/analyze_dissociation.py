@@ -130,12 +130,16 @@ def main() -> int:
         print("  Chaos never loses more; in 2 of 3 the arms are IDENTICAL.")
 
     # ---- what this can and cannot exclude, exactly --------------------------
-    nq = (base[0].get("index_recall_before") or {}).get("queries") if base else None
+    snap = (base[0].get("index_recall_before") or {}) if base else {}
+    nq = snap.get("queries")
+    # k is read from the record, not mirrored. Runs written before k was
+    # recorded fall back to 10, which is what those runs used.
+    kk = snap.get("k", 10)
     if nq and paired:
-        step = 1.0 / (nq * 10)
+        step = 1.0 / (nq * kk)
         bound = max(2 * step, max(abs(x) for x in paired)) + step
-        print(f"\n  RESOLUTION: {nq} queries x top-10 = {nq * 10} ground-truth "
-              f"items, so index_recall moves in steps of 1/{nq * 10} = {step:.4f}.")
+        print(f"\n  RESOLUTION: {nq} queries x top-{kk} = {nq * kk} ground-truth "
+              f"items, so index_recall moves in steps of 1/{nq * kk} = {step:.4f}.")
         print(f"  Largest chaos-specific deficit consistent with these pairs: "
               f"under ~{bound:.3f}.")
         print("  It does NOT exclude a deficit below the quantisation floor.")
