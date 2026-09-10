@@ -44,6 +44,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 
 
+try:  # Windows cp1252 stdout cannot print the em-dashes these files contain
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 def _paths():
     """Resolved lazily so tests can point the checks at a fixture tree."""
     return {
@@ -64,6 +70,14 @@ WITHDRAWAL_MARKERS = (
     "withdraw", "corrected", "supersed", "retired", "struck", "~~",
     "must not", "do not claim", "no longer", "was wrong", "falsified",
     "void", "amended", "not established", "refuted",
+    # Added 2026-09-10 (#67). Every marker above describes a claim being
+    # WITHDRAWN by its author. None describes a PREDICTION that was tested and
+    # failed, which is a different thing and is written differently: nobody says
+    # "we withdraw our prediction", they say it did not hold. The first real use
+    # of this check after #54 flagged RELATED_WORK section 4's honest report of
+    # exactly that as an unqualified retired claim.
+    "did not hold", "not observed", "not confirmed", "did not reproduce",
+    "was tested and", "predicted",
 )
 
 # Sections a SPEC must have once it carries results. Taken from SPEC_TEMPLATE.md
@@ -119,6 +133,24 @@ def date_opened(text):
 def status_of(text):
     m = re.search(r"^\*\*Status:\*\*\s*(.+)$", text, re.M)
     return m.group(1).strip() if m else ""
+
+
+def quoted(line, phrase):
+    """Is `phrase` inside a quoted span on this line?
+
+    A retired claim appearing in quotes is being reported, not asserted:
+    a spec names the claim it is about to test, a decision quotes the sentence
+    it is replacing. Distinguishing the two is what keeps this check usable on
+    the documents that do retirement properly.
+    """
+    low, p = line.lower(), phrase.lower()
+    spans = re.finditer(
+        '"[^"]*"'          # straight double quotes
+        '|“[^”]*”'   # curly double quotes
+        '|`[^`]*`'         # backticks
+        "|'[^']*'",        # single quotes
+        low)
+    return any(p in m.group(0) for m in spans)
 
 
 def load_retired():
@@ -269,6 +301,16 @@ def main(argv=None) -> int:
             for phrase, prov in retired:
                 if phrase.lower() in low:
                     if any(m in window for m in WITHDRAWAL_MARKERS):
+                        continue
+                    # A retired phrase inside quotation marks is being QUOTED,
+                    # not asserted -- and the documents that must quote it are
+                    # exactly the ones that retire it. claim_corrections/ is
+                    # already exempt wholesale; a study's own SPEC has the same
+                    # need, because a pre-registration names the claim it is
+                    # about to test. Added 2026-09-10 (#67), after arming the
+                    # registry produced six failures and every one of them was
+                    # a quotation in a spec that retired the claim.
+                    if quoted(line, phrase):
                         continue
                     fails.append(
                         f"[5] {rel}:{i} states a retired claim without a "
