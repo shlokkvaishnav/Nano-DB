@@ -3,7 +3,7 @@
 **Branch:** `experiment/dissociation-180s`
 **Issue:** #69
 **Date opened:** 2026-09-10
-**Status:** IN PROGRESS — pre-registered, no runs yet
+**Status:** COMPLETE — outcome (a). The negative survives at 180 s on **5 corpus-matched pairs, none censored**, at 0.001 resolution; mean paired difference **−0.0002**, deficit bound **~0.01**. #54's "identical arms" were a quantisation artifact. The bound is now **variance**-limited, not resolution-limited.
 
 <!-- The body below is issue #69, copied verbatim. The issue and this spec are
 the same content at every stage; Results / Interpretation / Decision are
@@ -102,3 +102,109 @@ No outcome licenses a claim about *why* the graph does or does not recover. The 
 
 - [x] Checked `README.md`'s open questions and `DECISION_LOG.md` — this is consequence 1 of #54's Decision and an input to the 2026-09-10 pivot trigger.
 - [x] One answerable question: does the negative survive a longer horizon and a finer instrument?
+
+## Amendment 1 (2026-09-11, after two discarded attempts): stale classes were silently reused
+
+Two sweeps were discarded before the one reported above. Both were apparatus failures, and the second is the more interesting.
+
+**Attempt 1 — a replica-placement race, caught by its guard.** Five of ten runs aborted with `class placed on 2/3 replicas`. Cause: a chaos run restarts the victim at the end, and the next run created its class before that node had rejoined **schema membership**. HTTP-ready is not the same as being in the replica set — node2 was six minutes into a restart while its peers had been up 58.
+
+The Amendment-4 placement guard caught every one, which is the difference from the silent *"cannot achieve consistency level ALL"* partial writes that preceded it. But aborting is the wrong response to something that resolves in seconds, so the harness now **waits for 3/3 membership** before creating a class, keeping the abort as a backstop.
+
+**Attempt 2 — the classes were never actually fresh.** Ten runs completed with no aborts, and five were silently invalid: their `index_recall` read `before == after` and their chaos arms were **left**-censored, meaning the victim already held everything on the first probe.
+
+Amendment 4 promised "a fresh class per run" and only ever *created* one. `create_class()` tolerates an existing class — it returns 200 with *"class already existed with the expected config"* — so every run whose attempt-1 counterpart had **completed** inherited that attempt's populated 10,000-object class, and its before-snapshot was taken on a corpus that was already full.
+
+The correlation identified it: every run whose counterpart completed was broken, every run whose counterpart aborted was correct, with no exceptions.
+
+Fixed by **deleting before creating**, plus an assertion that the class holds zero objects at creation, so it cannot recur silently.
+
+**This is the third recurrence of the same shape in this study**, and the pattern is worth naming:
+
+| amendment | stale state | how it was cleaned | what broke |
+|---|---|---|---|
+| 2 | 14,200-object shared class | never cleaned | graph axis read 0.23 on a healthy replica |
+| 4 | batch-deleted objects | delete, tolerantly | tombstones stalled async repair permanently |
+| 1 (here) | previous attempt's class | create, tolerantly | 5 runs inherited a populated corpus |
+
+Every one is **a cleanup that was tolerant rather than assertive**, and every fix has been to assert the post-condition — count is zero, placement is 3/3, the control scores above its floor — instead of trusting that setup worked.
+
+Both discarded attempts are kept beside the results (`dissociation.aborted-attempt.json`, `dissociation.attempt2-stale-class.json`) rather than deleted, because they are the evidence for this amendment.
+
+**Three startup defects were also fixed en route**, all the same root cause — checks that assumed a pre-existing class, which Amendment 4 had made obsolete: the topology check refused to run on a clean cluster (404), and the distance metric was read at startup rather than from the class each run creates. The metric is now read back from the class actually being measured.
+
+
+---
+
+## Results
+
+**Outcome (a). The negative survives, on 5 corpus-matched pairs with nothing censored, at 5× the resolution.** 10 of 10 runs valid, no aborts — on the third attempt (see Amendment 1).
+
+### Every seed uncensored, every pair matched
+
+| seed | control drift | chaos delta | **paired diff** | `completeness` | censored | recovery |
+|---|---|---|---|---|---|---|
+| 20260900 | −0.047 | −0.045 | **+0.002** | 1.00 | none | 44.49 s |
+| 20260901 | −0.053 | −0.062 | **−0.009** | 1.00 | none | 40.90 s |
+| 20260902 | −0.049 | −0.052 | **−0.003** | 1.00 | none | 45.85 s |
+| 20260903 | −0.047 | −0.044 | **+0.003** | 1.00 | none | 41.96 s |
+| 20260904 | −0.059 | −0.053 | **+0.006** | 1.00 | none | 38.34 s |
+
+**Mean paired difference −0.0002** — two thousandths of one step. The five differences straddle zero: three positive, two negative, none larger than 0.009.
+
+Against #54:
+
+| | #54 | #69 |
+|---|---|---|
+| window | 60 s | **180 s** |
+| resolution | 0.005 | **0.001** |
+| corpus-matched pairs | 3 of 5 | **5 of 5** |
+| right-censored | 2 | **0** |
+| excluded deficit | ~0.020 | **~0.010** |
+| mean paired difference | +0.005 | **−0.0002** |
+
+### The hypothesis was right about censoring and wrong about the numbers
+
+The pre-registered expectation was that 180 s would uncensor every seed. It did: recovery ran **38.34–45.85 s**, comfortably inside the window, where #54 saw 40.08–60.55 s with one seed finishing *past* nominal.
+
+But the expectation that the bound would tighten "toward ~0.005" was optimistic. The bound is **~0.010**, because it is driven by the largest observed paired difference (0.009) rather than by the quantisation floor alone. Raising resolution 5× did not tighten the bound 5×; it revealed per-seed variation that the coarse ruler had been rounding to zero.
+
+**That is the substantive finding of this re-run, and it cuts against #54's presentation.** #54 reported paired differences of "0.000, 0.000, +0.015" and leaned on the two exact zeros — *"in 2 of 3 the arms are IDENTICAL"*. At 0.001 resolution no pair is identical. Those zeros were the ruler, not the system.
+
+### The per-seed criterion says 2 of 5, and that is the wrong statistic
+
+Scored per seed, chaos loses more than its control in seeds 20260901 (−0.009) and 20260902 (−0.003) — so the registered binary criterion reports "2 of 5 show the dissociation", against #54's 0 of 5.
+
+**This is not evidence of a dissociation appearing.** A per-seed sign test discards magnitude, and differences straddling zero with a mean of −0.0002 are what a null looks like once the instrument can resolve noise. #54's 0 of 5 and #69's 2 of 5 are the same result seen through rulers of different fineness: the coarse one quantised small negatives to zero.
+
+The analyser now says so in its own output rather than leaving a reader to count seeds.
+
+### The control is not stable, and that matters
+
+`max |drift| = 0.059` across the no-chaos arm — the corpus-size effect from doubling 5,000 → 10,000, which is why the corpus-matched control exists. But the drift itself **varies by seed** from −0.047 to −0.059, a spread of 0.012 that is larger than every paired difference in the table.
+
+So the paired design is doing all the work here. An unpaired comparison gives baseline 0.9222 vs chaos 0.9218, p = 1.0000 — reported as reference only, since it discards the pairing the design produces.
+
+## Interpretation
+
+**#54's conclusion holds and is now better evidenced: at 180 s, with the data fully repaired in every seed, graph quality is indistinguishable from a no-chaos run over the same corpus.**
+
+This is the stronger version of the negative. It rests on five matched pairs rather than three, with nothing censored, and it excludes a chaos-specific deficit above **~0.01** rather than ~0.02. Neither pre-registered alternative fired: no deficit appeared between 60 s and 180 s (null i), and none appeared when the floor dropped to 0.001 (null ii).
+
+**What genuinely changed is the honesty of the bound.** #54's "two arms identical" was an artifact of a ruler with 0.005 steps. The real picture is per-seed variation of ±0.009 around zero — small, unbiased in sign, and larger than the resolution. A future run wanting a tighter bound needs *more seeds*, not more queries: the limit is now seed-to-seed variance, not quantisation. That is a change of regime, and it is the useful thing this re-run establishes for planning.
+
+**Still a horizon claim.** Nothing here observes past 180 s. #37 remains the precedent that horizons change healing verdicts.
+
+**Still one system, one build, one host, n = 5.**
+
+## Decision
+
+**MERGE**, as outcome (a).
+
+**What must not be claimed.** That the dissociation is refuted in general — one system, 180 s, n = 5, deficit bound ~0.01. That "2 of 5 seeds show the dissociation" — that is a sign count on a null, and reporting it as a positive would invert the result. That the bound can be tightened by resolution alone — it is now variance-limited.
+
+**Consequences to file.**
+
+1. `experiment/*` — **more seeds, not more queries.** The bound is set by seed-to-seed variance (±0.009), which is above the 0.001 floor. This is the first result in the project where the n = 5 ceiling is the *binding* constraint on a claim rather than a caveat attached to one, and it is a concrete ask for the PARAM Shavak access.
+2. `analysis/*` — **#54's "the arms are IDENTICAL" phrasing should be corrected.** It reported a quantisation artifact as a property of the system. Not a wrong conclusion, but a wrong reason, and this project records those.
+3. `method/*` — the analyser carried three hardcoded strings from #54 that misreported #69's data (a seed count, a contamination claim, and a 60 s horizon). All three are now derived. Prose in an analyser goes stale exactly as a constant does.

@@ -50,7 +50,14 @@ CLASS_NAME = "RrdVector"
 VECTOR_DIM = 128
 
 HTTP_BASE = 8080          # host port for node 0; node n -> HTTP_BASE + n
-GRPC_BASE = 50151
+GRPC_BASE = 50551      # NOT 50151: Windows reserves 50060-50259 for Hyper-V
+                       # /WinNAT, and binding there fails with "an attempt was
+                       # made to access a socket in a way forbidden by its
+                       # access permissions" -- which reads like a permissions
+                       # problem and is a reserved-range problem. Nothing in
+                       # this project connects to the gRPC port; it is mapped
+                       # for a client that might. Check with:
+                       #   netsh interface ipv4 show excludedportrange protocol=tcp
 CLUSTER_BASE = 7100
 # Issue #43: the inter-node replication API listens on CLUSTER_DATA_BIND_PORT
 # and is NOT served on the main HTTP port (checked: /replicas/... and

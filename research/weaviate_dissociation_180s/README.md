@@ -1,6 +1,38 @@
 # Does #54's negative survive a longer horizon and a finer ruler?
 
-Issue #69 · branch `experiment/dissociation-180s` · **pre-registered, no runs yet.**
+Issue #69 · branch `experiment/dissociation-180s` · **Outcome (a): the negative survives, and is now variance-limited rather than resolution-limited.**
+
+## The result
+
+| seed | control drift | chaos delta | **paired diff** | censored | recovery |
+|---|---|---|---|---|---|
+| 20260900 | −0.047 | −0.045 | **+0.002** | none | 44.49 s |
+| 20260901 | −0.053 | −0.062 | **−0.009** | none | 40.90 s |
+| 20260902 | −0.049 | −0.052 | **−0.003** | none | 45.85 s |
+| 20260903 | −0.047 | −0.044 | **+0.003** | none | 41.96 s |
+| 20260904 | −0.059 | −0.053 | **+0.006** | none | 38.34 s |
+
+**Mean paired difference −0.0002.** Five matched pairs, `completeness` 1.0 in all five, **nothing censored**, recovery 38–46 s well inside the 180 s window.
+
+| | #54 | here |
+|---|---|---|
+| window / resolution | 60 s / 0.005 | **180 s / 0.001** |
+| matched pairs, censored | 3 of 5, 2 censored | **5 of 5, 0 censored** |
+| excluded deficit | ~0.020 | **~0.010** |
+
+## What actually changed, and it is not what was predicted
+
+The window did its job — every seed uncensored, where #54 had one recovering *past* its 60 s nominal.
+
+But the bound only halved, not fifthed. It is set by the largest paired difference (0.009), **not** by the quantisation floor (0.001). Raising resolution 5× did not tighten the bound 5×; it exposed per-seed variation the coarse ruler had been rounding away.
+
+**So #54's headline detail was an artifact.** It reported "0.000, 0.000, +0.015" and leaned on the two exact zeros — *"in 2 of 3 the arms are IDENTICAL"*. At 0.001 resolution **no pair is identical**. Those zeros were the ruler, not the system.
+
+**The bound is now variance-limited.** A tighter one needs *more seeds*, not more queries. This is the first result in the project where the n = 5 ceiling is the binding constraint on a claim rather than a caveat attached to one.
+
+## The per-seed count says 2 of 5 — ignore it
+
+Scored per seed, chaos loses more in two seeds (−0.009, −0.003), so the registered binary criterion reads "2 of 5" against #54's "0 of 5". That is **not** a dissociation appearing: a sign test discards magnitude, and five differences straddling zero with a mean of −0.0002 are what a null looks like once the instrument can resolve noise. The analyser now says this in its own output rather than leaving a reader to count seeds.
 
 ## Why re-run a result that already landed
 
