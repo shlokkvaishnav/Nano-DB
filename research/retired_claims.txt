@@ -26,3 +26,13 @@ uniform-ish over an interval :: #48 step 2b / PR #49 -- refuted by the randomize
 older divergence repairs faster :: #48 step 2c review / PR #51 -- withdrawn as an explanation; from the write, B and C are 38.9 s vs 36.9 s
 Qdrant's ANN graph resists chaos :: 2026-09-04 / PR #31 -- measured on an indexed corpus, it does diverge at the replica level
 first run fastest :: #48 / PR #51 -- the first run is among the fastest; the minimum is rep 1
+# --- added 2026-09-10 (#67), the retirements that were never registered ---
+# Each of these was withdrawn in a merged PR whose author did not add the phrase
+# here, which is why check [5] stayed silent and the corrections were made by
+# hand instead. Registered now, retroactively.
+6 s ramp :: #63 / PR #64 -- the span of the last three stored samples at a probe-bound ~2 s cadence
+6s ramp :: #63 / PR #64 -- same retirement, unspaced spelling
+size decides step-vs-curve :: #63 / PR #64 -- there is no measured curve to attribute to size; the shape is burst -> ~30 s plateau -> completion
+genuinely observed ramp :: #63 / PR #64 -- it was three probe calls, not an observation of transfer
+leaves the *graph* unrepaired :: #54 / PR #61 -- the predicted consequence was tested on Weaviate and NOT observed; both axes heal at 60 s, n=3 matched pairs, deficit bound ~0.02
+does not fully heal :: #37 -- Qdrant index_recall heals at 180 s; the 50 s reading was a horizon effect
